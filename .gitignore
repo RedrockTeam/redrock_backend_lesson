@@ -1,4 +1,3 @@
-# 讲师本地导出文件
-.DS_Store
 *.pdf
 *.mp4
+.DS_Store
