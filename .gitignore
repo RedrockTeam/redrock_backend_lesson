@@ -1,3 +1,5 @@
 *.pdf
 *.mp4
 .DS_Store
+.obsidian
+.idea
