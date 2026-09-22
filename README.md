@@ -1,7 +1,7 @@
-# 红岩网校 2026 Go 入门课件
+# 红岩网校Go 入门课件
 
-这是教师侧可见课件仓库，独立于练习仓库。这里只保留课程目标、讲解顺序、演示提示和课堂转场，不放题目答案、隐藏测试或评分实现。
 
+2026:
 - [lesson-00--notice](lesson-00-notice): ai 使用指南和其他事项
 - [lesson-01-basics](lesson-01-basics.md)：从 c 语言到 go 的语法迁移，go 的 package 讲解
 - [lesson-02-collections](lesson-02-collections.md)：go 的其他基本结构例如 map interface 切片的讲解
