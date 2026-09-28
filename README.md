@@ -1,7 +1,7 @@
 # 红岩网校Go 入门课件
 
 
-2026:
+2026-2027:
 - [lesson-00--notice](2026/lesson-00-notice): ai 使用指南和其他事项
 - [lesson-01-basics](2026/lesson-01-basics.md)：从 c 语言到 go 的语法迁移，go 的 package 讲解
 - [lesson-02-collections](2026/lesson-02-collections.md)：go 的其他基本结构例如 map interface 切片的讲解
@@ -13,3 +13,12 @@
 - lesson8：go 语言中数据库句柄的使用以及简单介绍如何实现上层统一抽象的
 - lesson9：缓存机制的介绍以及多个缓存层的实现
 - lesson10：redis 的基本机制以及使用方式的讲解。
+
+2025-2026：
+
+- 之前的课件，分为上学期和下学期部分路线比较完整，但是课件间很跳跃，go 的语言只有两个相对简单的语法讲解。
+
+
+2022-2023:
+
+- 很早之前的课件，不大完整，也没有固定顺序，可以用作额外参考。
