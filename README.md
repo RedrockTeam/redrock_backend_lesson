@@ -9,7 +9,7 @@
 - [lesson-04-sync](2026-2027/lesson-04-sync.md)：对接之前部分 go 协程练习题中的数据竞争问题，并由此介绍锁和 waitgroup
 - lesson5: 计算机网路基础以及 go 的网络包的介绍及使用
 - lesson6： web 框架介绍，需包含横向对比和单个 web 框架的深入介绍
-- lesson7：数据库的基础知识和基本原理，基础 sql 语句等
+- [lesson-07-database](2026-2027/lesson-07-database.md)：数据库的基础知识和基本原理，基础 sql 语句等
 - lesson8：go 语言中数据库句柄的使用以及简单介绍如何实现上层统一抽象的
 - lesson9：缓存机制的介绍以及多个缓存层的实现
 - lesson10：redis 的基本机制以及使用方式的讲解。
