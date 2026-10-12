@@ -39,18 +39,20 @@ func main() {
 
 ### 2. 共享变量的读改写不是一步完成的
 
+下面用到了第四部分的 `sync.WaitGroup`——它只负责**等这组 goroutine 全部结束**，细节后面再讲，这里先看现象。
+
 ```go
 func main() {
     var n int
     var wg sync.WaitGroup
     wg.Add(2)
     for i := 0; i < 2; i++ {
-        //启用两个携程
+        // 启动两个协程
         go func() {
             defer wg.Done()
             for j := 0; j < 100000; j++ {
                 n++
-                //分别对n+100000
+                // 每个协程加 100000 次
             }
         }()
     }
@@ -90,10 +92,10 @@ exit status 66
 关于数据竞争有两个重点：
 
 - **某次输出正确，不等于程序没有竞态。** 竞争是概率事件，竞态检测器看的是有没有**建立顺序**，不是**结果对不对**。
-- 数据竞争在 C 里也许只是**结果有问题**，但在 Go 里更严重：**并发的 map 写会让整个进程直接 `fatal error: concurrent map writes` 退出**
+- 数据竞争在 C 里也许只是**结果有问题**，但在 Go 里更严重：**并发的 map 写会让整个进程直接 `fatal error: concurrent map writes` 退出**。
 
 
-### 3. 三个问题，三个工具
+### 3. 三个问题，一张分工表
 
 上面两个问题之外，还有第三个：**多个 goroutine 的任务什么时候算全部做完**，这在第三课的练习里已经遇到过。
 
@@ -114,29 +116,13 @@ for i := 0; i < 3; i++ {
 | 无法中途停下 | 没有取消机制 | `select` + `context` |
 | 初始化被重复执行 | 没有只做一次的表达 | `sync.Once` |
 
-```text
-                    一个 goroutine 需要和别的 goroutine 建立的关系
-                                    │
-        ┌───────────────┬───────────┼───────────┬───────────────┐
-        ▼               ▼           ▼           ▼               ▼
-    传数据/传任务     等它结束    通知它停止   保护同一块内存   只初始化一次
-        │               │           │           │               │
-        ▼               ▼           ▼           ▼               ▼
-     channel        WaitGroup   close(done)   Mutex/RWMutex    Once
-                                context.Done()  atomic        Pool
-        │               │           │           │
-        └───────────────┴───────────┴───────────┘
-                     它们的共同点：
-              都在两个 goroutine 之间建立先后顺序
-```
-
 ### 4. 为什么**看起来对**不算对：happens-before
 
 同步原语的真正价值是**建立顺序保证**。
 
 可以这样理解：编译器和 CPU 都会为了性能重排指令；每个 CPU 核心还有自己的缓存，一个核心写下的值不保证能立刻被另一个核心看到。
 
-所以**A 先执行、B 后执行**这件事，如果没有任何同步手段，程序里是不保证成立的。Go 的内存模型给出的说法是：**只有当操作 X happens before 操作 Y 时，X 写入的值才保证能被 Y 看到。**
+所以**A 先执行、B 后执行**这件事，如果没有任何同步手段，程序里是不保证成立的。Go 的内存模型给出的说法是：**只有当操作 X happens before 操作 Y 时，X 写入的值才保证能被 Y 看到。** 日常用到的对应关系就是下表（左列 happens before 右列）：
 
 | 操作 A | 操作 B |
 | --- | --- |
@@ -147,9 +133,7 @@ for i := 0; i < 3; i++ {
 | `once.Do(f)` 里的 `f` 返回 | 任何 `once.Do` 返回 | 
 | `atomic` 的某次写 | 后续观察到这个值的 `atomic` 读 |
 
-以上的同步原语已经确保实现了 A happens before B
-
-反过来说，**只要用了这些原语中的任意一种把顺序建立起来，就能保证A 先执行、B 后执行**，不会出现前面提到的问题。
+**只要用了这张表里的任意一种原语把顺序建立起来，就一定实现了对应的 happens-before**，不会出现前面提到的问题。
 
 ---
 
@@ -179,14 +163,14 @@ ch := make(chan int)      // 无缓冲：容量为 0
 buf := make(chan int, 3)  // 有缓冲：容量为 3
 ```
 
-为什么必须用 `make`？回想第二课的 `make` vs `new`：`make` 负责初始化那些**需要内部结构**的类型（切片、map、channel）。channel 内部有一把锁、一个等待接收者队列、一个等待发送者队列和（可能的）缓冲区，用零值无法使用：
+不能用 `new` 只能用 `make` 以初始化那些**需要内部结构**的类型（切片、map、channel）。channel 内部有一把锁、一个等待接收者队列、一个等待发送者队列和（可能的）缓冲区，用零值无法使用：
 
 ```go
 var ch chan int // nil channel
 ch <- 1         // 永久阻塞
 ```
 
-**缓冲区解决什么问题。** 无缓冲 channel 要求发送和接收**同时就位**，有缓冲 channel 则允许发送方在缓冲区没满时先走一步，从而削减短期峰值，减少调度次数，但是不能解决收发速度差异，发送稳定快于接受仍会阻塞。
+**缓冲区解决什么问题。** 无缓冲 channel 要求发送和接收**同时就位**，有缓冲 channel 则允许发送方在缓冲区没满时先走一步，从而削减短期峰值，减少调度次数，但是不能解决收发速度差异，发送稳定快于接收仍会阻塞。
 
 
 | 类型 | 发送阻塞条件 | 接收阻塞条件 | `cap` | 典型用途 |
@@ -219,16 +203,18 @@ fmt.Println(len(ch), cap(ch)) // 1 3
 `ok` 这个返回值为什么必须存在？因为接收一个已关闭的 channel **不会报错**，它立刻返回零值：
 
 ```go
-func consume(in <-chan int) {
-    for {
-        v := <-in
-        if v == 0 { 
-            handle（v）//如果零值是某个业务条件会误触发
-        }
+v := <-in
+if v == 0 {   // 错：零值可能真是业务数据，也可能是上游已经关闭
+    return
+}
 
-    }
+v, ok := <-in
+if !ok {      // 对：用第二个返回值区分两种情况
+    return
 }
 ```
+
+所以：**只要上游有可能关闭，就必须用 `v, ok := <-ch`**；只有确定它不会关闭，才能用 `v := <-ch`。
 
 
 ### 4. 通道方向：`chan<- T` 与 `<-chan T`
@@ -315,8 +301,6 @@ func bad() {
 
 多个发送方的正确写法是：**让所有生产者都结束后，由一个专门的 goroutine 关闭公共出口**。这里的关键是**等所有生产者退出**——这需要第四部分的 `sync.WaitGroup`（生产者里 `Done`，协调者的 `Wait` 返回之后再 `close`），完整写法见第七部分的 fan-in。
 
-现在只需要知道：**谁生产谁关闭自己的出口；公共出口只由那个唯一的协调者关闭。**
-
 ### 8. 遍历：`for range` 与 `for select` 的分工
 
 | 写法 | 何时结束 | 能否同时处理取消 | 适用场景 |
@@ -361,6 +345,7 @@ func withSem(sem chan struct{}, job int) {
 创建时给定容量即可：`sem := make(chan struct{}, limit)`。要**给一批任务都套上它、并等它们全部结束**，还需要第四部分的 `sync.WaitGroup` 来计数（完整写法见第七部分的并发限流）。
 
 用 `cap = 1` 的 channel 也能做互斥，但**不推荐**作为通用锁，性能更差。
+
 ### 10. channel 的代价与边界
 
 - **每次传递都有开销**：涉及 runtime 的调度与锁，比直接读写内存慢得多。高频计数、超小数据用 `atomic` 或 `Mutex` 更合适。
@@ -372,7 +357,8 @@ func withSem(sem chan struct{}, job int) {
 ### 1. 为什么需要 select
 
 一个 worker 常常要**同时等好几个事件**：新任务来了要处理，收到取消要退出。只有 `channel` 时这很难两全——阻塞在一个 channel 上就没法再响应取消。
-`select` 负责的就是**同时等多路事件**：它把多路等待做成一条语句，直接由 runtime 实现
+`select` 负责的就是**同时等多路事件**：它把多路等待做成一条语句，直接由 runtime 实现。
+
 ### 2. 语义要点
 
 ```go
@@ -393,7 +379,7 @@ default:
 | 都不就绪 | 阻塞等待；若有 `default`，立刻执行 `default` 并结束 |
 | `nil` channel 的 `case` | 永远不就绪 → 可用于动态禁用分支（见下例） |
 | `case` 的求值 | 进入 `select` 时先求出所有 channel 操作数，再判断就绪 |
-| `select {}` | 永久阻塞（如果所有 goroutine 都阻塞，runtime 会报 `fatal error: all goroutines are asleep - deadlock!`） |
+| `select {}` | 永久阻塞（什么时候才会报死锁，见第九部分） |
 | `break` | 只跳出 `select`，不会跳出外层 `for` |
 
 **`nil` channel 的用法**：把某个 `case` 的 channel 置为 `nil`，这个分支就永远不会被选中，等于**动态关掉它**。合并两个数据源时特别顺手——读完一个就把它设 `nil`，剩下的继续读：
@@ -450,9 +436,8 @@ for {
 
 ### 4. 超时：`time.After`、`time.NewTimer`、`time.Ticker`
 
-**为什么需要超时** 
+**为什么需要超时。** 网络对端可能永远不回应，数据库可能锁住，第三方接口可能挂起。等不到结果的等待必须有个上限，否则一个挂起的下游会把整条请求链拖住。
 
-网络对端可能永远不回应，数据库可能锁住，第三方接口可能挂起。有些不确定有没有结果的等待任务仍需要一个默认情况，这就是超时的作用。
 ```go
 select {
 case v := <-results:
@@ -612,6 +597,8 @@ func run(ctx context.Context, jobs []int) []int {
 | `wg.Wait()` | 阻塞，直到计数归零 |
 | `wg.Go(f func())` | Go 1.25 新增：等价于 `Add(1)` + `go` + 结束时自动 `Done` |
 
+**零值即可用**：`var wg sync.WaitGroup` 直接就能用，不需要初始化。
+
 ```go
 func main() {
     var wg sync.WaitGroup
@@ -636,10 +623,9 @@ func main() {
   │ Wait() 立刻返回          │ Wait() 在这里阻塞
   │                         │
   └─────────────────────────┘
-  计数不能为负：Done 多于 Add 会 panic
 ```
 
-### 3. 五条规则
+### 3. 四条规则
 
 | 规则 | 违反后果 |
 | --- | --- |
@@ -647,7 +633,6 @@ func main() {
 | `Add(1)` 与 `Done()` 必须一一对应 | 少一次 `Done` 就永久阻塞；多一次 `Done` 会 `panic: sync: negative WaitGroup counter` |
 | 用 `defer wg.Done()` 而不是在末尾手动写 | 提前 `return` 或 panic 的路径上，`Done` 会被漏掉 |
 | 不要复制 `WaitGroup`（用 `*sync.WaitGroup` 传递） | 两个计数器各自计数，`Wait` 永远等不到；`go vet` 会以 `copylocks` 报警 |
-| 零值即可用，不需要初始化 | —— |
 
 `Add` 的时机值得单独强调。下面这段是经典错误：
 
@@ -661,7 +646,7 @@ for i := 0; i < 3; i++ {
 }
 wg.Wait()
 ```
-**计数从 0 变成正数必须发生在 `Wait` 可能看到 0 之前**。所以习惯上把 `Add` 放在 `go` 之前，由启动者负责计数，goroutine 只负责 `Done`。
+**计数从 0 变成正数必须发生在 `Wait` 可能看到 0 之前**——这就是上表第一条规则的由来。
 
 Go 1.25 的 `wg.Go` 把这三件事合成一件，从根上解决了**忘写 `Done`**和**`Add` 放错位置**两个错误：
 
@@ -839,25 +824,7 @@ once.Do(func() { init() })  // 并发调用下只执行一次
 ---
 ## 七、组合：把工具拼起来能得到什么
 
-前面六部分讲的是零件。真实的并发功能都是**组合**出来的，而且组合方式相当固定——八成的场景就是下面这几种。这一节对每个功能都给出三件事：**要实现什么**、**组合了哪些 API**、**代码**，最后用一句话点出**少了某个零件会怎样**。
-
-### 0. 组合矩阵
-
-| 功能 | channel | select / context | WaitGroup | Mutex / RWMutex | Once / atomic / Pool |
-| --- | --- | --- | --- | --- | --- |
-| 流水线 | ✓ 必需 | ✓ 取消时必需 | 可选 | —— | —— |
-| fan-out / fan-in | ✓ 必需 | 可选 | ✓ 必需（汇聚时） | —— | —— |
-| 固定 worker 任务池 | ✓ 必需 | ✓ 必需 | ✓ 必需 | —— | —— |
-| 批量任务 + 超时 | ✓ 必需 | ✓ 必需 | ✓ 必需 | —— | —— |
-| 并发聚合（保序） | 可选 | 可选 | ✓ 必需 | —— | —— |
-| 错误传播与快速失败 | ✓ 必需 | ✓ 必需 | ✓ 必需 | —— | —— |
-| 并发限流 | ✓ 必需（当令牌） | 可选 | ✓ 需要 | —— | —— |
-| 优雅关闭 | ✓ 广播 | ✓ 兜底 | ✓ 必需 | ✓ 必需（状态标志） | —— |
-| 单例与热更新 | —— | —— | —— | ✓ 可选 | ✓ 必需 |
-| 临时对象复用 | 可选 | —— | —— | —— | ✓ 必需 |
-
-**`channel` + `select`/`context` + `WaitGroup` 这三件套覆盖了绝大多数并发场景**，锁只在**有真正被共享的内存**时出场。
-
+前面六部分讲的是零件。真实的并发功能都是**组合**出来的，而且组合方式相当固定——下面这四种覆盖了绝大多数场景。这一节对每个功能都给出三件事：**要实现什么**、**组合了哪些 API**、**代码**，最后用一句话点出**少了某个零件会怎样**。
 
 
 ### 1. 流水线（pipeline）
@@ -935,11 +902,11 @@ func merge(inputs ...<-chan int) <-chan int {
 }
 ```
 
-三个容易写错的地方：`close(out)` 只能有一个执行者（第二次 close 就 panic）；`wg.Wait()` 必须放在**另一个** goroutine 里，否则函数会阻塞到全部处理完才返回；`in` 最好当参数传进闭包（Go 1.22 之前循环变量会被所有 goroutine 共享）。**顺序会变**——fan-out 之后结果到达顺序不再等于输入顺序，要保序见第 5 小节。
+`close(out)` 只能有一个执行者（第二次 close 就 panic）；`wg.Wait()` 必须放在**另一个** goroutine 里，否则函数会阻塞到全部处理完才返回；`in` 最好当参数传进闭包（Go 1.22 之前循环变量会被所有 goroutine 共享）。**顺序会变**——fan-out 之后结果到达顺序不再等于输入顺序；要保序，就在收集侧把结果按下标写回预先分配的切片。
 
 ### 3. 固定 worker 数量的任务池
 
-**要实现什么**：限制**同一时刻有多少个任务在跑**。不限制时一万个请求就起一万个 goroutine，下游连接池会被打爆。**组合**：`jobs` channel（任务队列）+ `results` channel（结果回收）+ `WaitGroup`（等 worker 全退出）+ `context`（取消）。
+**要实现什么**：限制**同一时刻有多少个任务在跑**。不限制一万个请求就起一万个 goroutine，下游连接池会被打爆。**组合**：`jobs` channel（任务队列）+ `results` channel（结果回收）+ `WaitGroup`（等 worker 全退出）+ `context`（取消）。
 
 ```go
 type Result struct {
@@ -1004,115 +971,9 @@ func run(ctx context.Context, jobs []int, workerCount int) []Result {
 }
 ```
 
-三个关闭点必须各自分清：`close(jobCh)` 由**投递者**做（只有它知道没有更多任务了），`close(resultCh)` 由 `wg.Wait()` 之后的**协调者**做（只有它知道所有 worker 都停了），`ctx` 的 `cancel()` 由**调用方**做——写错的后果都是 panic 或泄漏。**一个必须接受的代价**：结果顺序不确定，谁先算完谁先发；要保序配合第 5 小节的按下标写入。
+三个关闭点必须各自分清：`close(jobCh)` 由**投递者**做（只有它知道没有更多任务了），`close(resultCh)` 由 `wg.Wait()` 之后的**协调者**做（只有它知道所有 worker 都停了），`ctx` 的 `cancel()` 由**调用方**做——写错的后果都是 panic 或泄漏。结果顺序不确定，谁先算完谁先发。有序化要在收集侧把结果按下标写回预先分配的切片。
 
-### 4. 带超时与取消的批量任务
-
-**要实现什么**：一次并发做 N 件事，整体最多等 3 秒，到点返回已拿到的部分结果。**组合**：`context.WithTimeout` + 任务内检查 `ctx` + `WaitGroup` + `channel`。
-
-```go
-func gather(ctx context.Context, jobs []int, workers int) []Result {
-    ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
-    defer cancel() // 必须 defer，否则超时计时器无法释放
-
-    results := run(ctx, jobs, workers) // 复用上一小节的任务池
-    if err := ctx.Err(); err != nil {
-        fmt.Printf("批量任务未全部完成：%v，已收集 %d 条\n", err, len(results))
-    }
-    return results
-}
-```
-
-要点：超时是**协作式**的，`ctx` 只负责广播，退出要任务自己在 `select` 里检查；结果数量不确定是特性不是 bug——部分结果 + 明确的错误信息，比什么都没有有用；`cancel()` 即使已经超时也要调用；日志里要能区分 `Canceled`（上游主动取消）和 `DeadlineExceeded`（超时）。
-
-### 5. 并发聚合（需要保序时）
-
-**要实现什么**：并发处理一个切片，结果**按输入顺序**放进结果切片，且不用任何锁。**组合**：`WaitGroup` + 预分配切片 + **按下标写入**。
-
-```go
-func mapAll(inputs []int, workers int) ([]int, error) {
-    out := make([]int, len(inputs)) // 预先分配，长度固定
-    errs := make([]error, len(inputs))
-    sem := make(chan struct{}, workers) // 限制并发度
-    var wg sync.WaitGroup
-
-    for i, in := range inputs {
-        wg.Add(1)
-        go func(idx, val int) {
-            defer wg.Done()
-            sem <- struct{}{}
-            defer func() { <-sem }()
-            out[idx], errs[idx] = compute(val) // 各写各的槽位
-        }(i, in)
-    }
-    wg.Wait()
-
-    for _, err := range errs {
-        if err != nil {
-            return nil, err
-        }
-    }
-    return out, nil
-}
-```
-
-| 写法 | 是否安全 | 说明 |
-| --- | --- | --- |
-| 多个 goroutine `append(out, v)` | 不安全 | `append` 是读-改-写，并发调用会丢元素甚至崩 |
-| 按下标 `out[idx] = v` | 安全 | 每个 goroutine 只写自己那一个位置，无需同步 |
-| 用 `Mutex` 保护 `append` | 安全但慢 | 所有结果汇聚到一把锁上 |
-| 通过 channel 回收 | 安全，但不保序 | 需要额外记录下标来恢复顺序 |
-
-判断标准只有一句：**能不能让每个 goroutine 只碰自己的数据**，能就不用锁。
-
-### 6. 错误传播与快速失败
-
-**要实现什么**：一批并发任务里任何一个失败，立刻取消其余的，并把第一个错误返回给调用方。**组合**：`context.WithCancel` + 容量 1 的 `error` channel + `select`/`default` + `WaitGroup`。
-
-```go
-func runAll(ctx context.Context, jobs []int) error {
-    ctx, cancel := context.WithCancel(ctx)
-    defer cancel()
-
-    errCh := make(chan error, 1) // 容量 1：只保存第一个错误
-    var wg sync.WaitGroup
-    for _, job := range jobs {
-        wg.Go(func() {
-            if err := handle(ctx, job); err != nil {
-                select {
-                case errCh <- err: // 我是第一个出错的
-                    cancel()       // 通知其余任务停下
-                default:           // 已经有人报过错，直接放弃上报
-                }
-            }
-        })
-    }
-    wg.Wait() // 等所有任务真正退出，避免 goroutine 泄漏
-
-    select {
-    case err := <-errCh:
-        return err
-    default:
-        return nil
-    }
-}
-```
-
-要点：`errCh` 容量必须是 1 且发送用 `select`/`default`，否则第二个出错的任务会阻塞在发送上，`wg.Wait()` 永远等不完；`cancel()` 之后必须 `wg.Wait()`，否则函数返回后还有 goroutine 活着；用普通变量记第一个错误会有数据竞争。
-
-`golang.org/x/sync/errgroup` 把这套模式封装好了：
-
-```go
-g, ctx := errgroup.WithContext(ctx)
-for _, job := range jobs {
-    g.Go(func() error { return handle(ctx, job) })
-}
-err := g.Wait() // 返回第一个错误，并保证所有 goroutine 已退出
-```
-
-它就是**错误 channel + cancel + WaitGroup** 的语法糖，没有新概念。
-
-### 7. 并发限流（信号量）
+### 4. 并发限流（信号量）
 
 **要实现什么**：不管有多少任务，同一时刻最多 K 个在跑——保护下游（数据库、第三方接口）最直接的手段。**组合**：容量为 K 的 `channel` 当令牌桶 + `WaitGroup`。
 
@@ -1136,120 +997,16 @@ func limited(jobs []int, limit int) []int {
 
 和固定 worker 任务池的区别只有一问：**任务源源不断**（队列式）用任务池，**任务数不算巨大但要独占外部资源**用信号量。信号量里每个任务仍是一个 goroutine，只是被挡住，任务量极大时仍要小心；要在等令牌时也能取消，就把 `select` 写在取令牌那一步。
 
-### 8. 优雅关闭
+### 5. 每个功能的验收方式
 
-**要实现什么**：收到停止信号后——① 不再接受新任务；② 通知在途任务收尾；③ 等它们真正结束；④ 超过给定时间还没结束就报错退出。**组合**：`Mutex`（保护**是否已关闭**）+ `close(done)`（广播）+ `WaitGroup`（在途计数）+ `context`（兜底超时）。
-
-```text
-   正常运行
-      │  收到停止信号
-      ▼
-  ① 拒绝新任务         closed = true（必须在锁里）
-      │
-      ▼
-  ② 通知在途任务收尾    close(done)  ── 广播，一次唤醒全部
-      │
-      ▼
-  ③ 等在途任务结束      wg.Wait()    ── 不在持锁状态下等
-      │
-      ▼
-  ④ 收尾也不能无限等    select { <-finished / <-ctx.Done() }
-      │
-      ▼
-    退出（正常 / 报超时）
-```
-
-```go
-type Service struct {
-    mu     sync.Mutex
-    closed bool
-    wg     sync.WaitGroup
-    done   chan struct{}
-}
-
-func (s *Service) Handle(ctx context.Context, req int) error {
-    s.mu.Lock()
-    if s.closed {
-        s.mu.Unlock()
-        return errors.New("service is closing") // ① 拒绝新任务
-    }
-    s.wg.Add(1) // 与 closed 检查在同一段临界区里，否则会有竞态
-    s.mu.Unlock()
-
-    defer s.wg.Done()
-    select {
-    case <-ctx.Done():
-        return ctx.Err()
-    case <-s.done: // ② 收到停止信号，尽快收尾
-    case <-time.After(20 * time.Millisecond): // 正常处理
-    }
-    return nil
-}
-
-func (s *Service) Shutdown(ctx context.Context) error {
-    s.mu.Lock()
-    s.closed = true
-    close(s.done) // 广播
-    s.mu.Unlock()
-
-    finished := make(chan struct{})
-    go func() {
-        s.wg.Wait() // ③ 不能持锁等，否则拒绝新任务和等待互相锁死
-        close(finished)
-    }()
-
-    select {
-    case <-finished:
-        return nil
-    case <-ctx.Done(): // ④ 收尾超时
-        return ctx.Err()
-    }
-}
-```
-
-三个易错点：`closed` 检查与 `wg.Add(1)` 必须在同一段临界区里，否则关闭流程可能已经 `Wait` 完才 `Add`，出现**没人等的在途任务**；不能持锁调用 `wg.Wait()`，否则和在途任务、新任务互相锁死；只 `close(done)` 不 `Wait`，程序退出时数据可能只写了一半。
-
-### 9. 单例初始化与配置热更新
-
-**要实现什么**：连接池/配置只初始化一次；配置能原子地整体替换，读侧（每个请求）不加锁、不阻塞，也绝不会读到**改了一半**的配置。**组合**：`sync.Once` + `atomic.Pointer`。
-
-```go
-var (
-    once sync.Once
-    cfg  atomic.Pointer[Config]
-)
-
-func Config() *Config {
-    once.Do(func() {
-        c := loadConfig()
-        cfg.Store(c) // 先完整构造好，再一次性发布
-    })
-    return cfg.Load()
-}
-
-func Reload() {
-    cfg.Store(loadConfig()) // 整体换掉指针
-}
-```
-
-关键在**先构造完整，再一次性发布**：`loadConfig()` 返回的对象不再被修改，指针替换是原子操作，读方要么看到整套旧配置、要么看到整套新配置。选型只看三点：读写都少用 `Mutex`；读明显多于写用 `RWMutex`；值是**不可变对象、整体替换**才用 `atomic.Pointer`——这是并发编程里最省心的一条路。
-
-### 10. 每个功能的验收方式
-
-写完不算完，下面这张表给出**怎么证明它是对的**：
+下面这张表给出**怎么证明它是对的**：
 
 | 功能 | 验证方式 |
 | --- | --- |
 | 流水线 | 输入 N 个元素，输出正好 N 个；结束不阻塞 |
 | fan-out / fan-in | 结果集合与串行版本一致（顺序不同，用排序后比较） |
 | 任务池 | 并发数不超过 worker 数；`-race` 无报告；取消后 1 秒内返回 |
-| 批量任务 + 超时 | 人为让某个任务变慢，确认整体在 T 内返回 |
-| 并发聚合 | 结果顺序与输入一致；`-race` 无报告 |
-| 错误传播 | 注入一个必失败的任务，确认返回该错误且其余任务被取消 |
 | 并发限流 | 用计数器记录峰值并发数（在 `-race` 下断言峰值 ≤ limit） |
-| 优雅关闭 | 关闭期间新任务被拒绝；在途任务跑完；超时分支返回错误 |
-| 单例 | 并发调用 100 次，初始化只发生一次（在初始化里计数） |
-| 对象池 | 复用率不是正确性问题，用 `-benchmem` 看分配次数下降 |
 
 ---
 
@@ -1315,11 +1072,10 @@ func Reload() {
 | 进程被 `fatal error` 干掉 | 是否并发写 map、是否 `close` 了两次、是否向已关闭通道发送 | runtime 直接终止，`recover` 无效 |
 | goroutine 数量一直涨 | 每个 goroutine 的退出条件是什么 | 泄漏：没有人接收、没人取消、上游不关闭 |
 | 偶发失败，重跑就过 | 用 `-race` 和 `-count=10` 复现 | 时序相关的问题 |
-| 关闭服务时数据写了一半 | 是否只广播了停止，没有等 `WaitGroup` | 优雅关闭缺了第三步 |
+| 关闭服务时数据写了一半 | 是否只广播了停止，没有等 `WaitGroup` | 只 `close(done)` 不 `Wait`，进程就已经退出 |
 
 ### 2. 提交前的四问
 
-写并发代码时，这四句话能挡掉绝大多数事故；提交时在 PR 描述里逐条写下答案：
 
 1. 每个 channel 的发送方、接收方、关闭方分别是谁？
 2. 每个 goroutine 靠什么退出？每个阻塞点会被谁唤醒？
@@ -1342,14 +1098,7 @@ go test -timeout 10s ./... # 卡死时立刻失败，而不是一直挂着
 
 ## 十、课堂练习
 
-每一级的验收标准都写清楚了，做完必须能通过 `go test -race ./...`。
-
-### LV0：观察行为（理解语义）
-
-1. 分别用 `WaitGroup` 和 `channel` 改写**`main` 直接退出**的示例，让 `hello` 一定被打印。
-2. 创建容量为 0、1、2 的 channel，记录发送和接收分别在什么时刻阻塞，写成一张表。
-3. 解释为什么**接收方关闭 channel**可能导致发送方 panic，并写出一个能复现的最小程序。
-4. 用 `select` + `default` 实现**有就取，没有立刻返回**，对比用 `len(ch)` 判断的区别。
+做完必须能通过 `go test -race ./...`。
 
 ### LV1：安全计数器（`Mutex` / `atomic`）
 
@@ -1363,10 +1112,9 @@ func (c *Counter) Reset()
 
 验收标准：
 
-- 100 个 goroutine 各加 1000 次，`Value()` 必须等于 100000；
+- 100 个 goroutine 各加 100 次，`Value()` 必须等于 10000；
 - 零值 `Counter` 可直接使用；
 - `go test -race` 无报告；
-- 再用 `atomic.Int64` 实现一版，并用 `go test -bench` 比较两者性能。
 
 ### LV2：可取消的流水线
 
@@ -1397,23 +1145,10 @@ func (p *Pool) Shutdown(ctx context.Context) error
 - `Shutdown` 会拒绝新任务、等待在途任务、支持超时；
 - 任何一个任务出错时取消其余任务，并把错误返回给调用方。
 
-**动笔之前先画两张图**：任务 channel / 结果 channel / 关闭方 / 等待方分别是谁；每个 goroutine 的退出条件是什么。图画不出来，代码一定写不对。
 
 ---
 
-## 十一、验收与提交
-
-在项目根目录执行（命令清单见第九部分）：
-
-```bash
-gofmt -w . && go vet ./... && go test ./... && go test -race ./...
-```
-
-四项全过再提交。提交时在 PR 描述里回答第九部分那四个问题——**它们正是三年后你 review 别人并发代码时会问的东西，比代码本身更难写对**。
-
----
-
-## 总结
+## 十一、总结
 
 回头看这一课，所有的工具都在为**建立顺序**和**明确所有权**服务：
 
@@ -1426,11 +1161,6 @@ gofmt -w . && go vet ./... && go test ./... && go test -race ./...
 | `Mutex` / `RWMutex` | 共享内存被并发读写，结果错或崩溃 | 互斥 + `Unlock` → `Lock` 的顺序 |
 | `Once` / `atomic` | 初始化重复、单变量也要锁 | 只执行一次；单变量的原子读写 |
 
-三句话带走：
 
-1. **`channel` 管流，锁管存。** 先想清楚数据的所有权，再决定用哪个。
-2. **每个 goroutine 都必须有退出条件，每个阻塞点都必须有人唤醒。** 写不出来就说明代码有问题。
-3. **正确性是可以被检验的。** `go test -race` 不是可选项，它是这门课往后每一次提交的底线——第三课的练习题让你看见了问题，这一课让你有了证明的能力。
-
-下一课开始，这些工具会从**练习题**变成**业务代码的一部分**：处理一个 HTTP 请求要用 `context` 传递取消和超时，访问数据库要通过连接池限制并发，返回结果要经过一层层 `channel` 或锁保护的缓存。等你写 Web 框架和数据库那两节课时，会不断回到这一课的表格上来。
+下一课开始，这些工具会从**练习题**变成**业务代码的一部分**：处理一个 HTTP 请求要用 `context` 传递取消和超时，访问数据库要通过连接池限制并发，返回结果要经过一层层 `channel` 或锁保护的缓存。有很多业务代码因为需求都有高度结构化和相似的内容，理解并熟练掌握本节课的内容会对以后的业务编写（或者单纯阅读理解ai的代码）有很大帮助
 
