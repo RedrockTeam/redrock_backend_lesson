@@ -1129,7 +1129,7 @@ func (c *Counter) Reset()
 - 每一级的发送和接收都要能被取消；
 - 调用方收到前两个结果后调用 `cancel()`；
 - 测试必须在 1 秒内结束；
-- 结束后用 `runtime.NumGoroutine()` 辅助观察是否有遗留 goroutine；它是进程级瞬时数量，不能单独作为严格断言，还要配合超时和明确的退出信号。
+- 结束后用 `runtime.NumGoroutine()` 辅助观察是否有遗留 goroutine
 
 ### LV3：worker pool（结课题）
 
