@@ -157,48 +157,13 @@ for i := 0; i < 3; i++ {
 
 ### 1. 为什么需要 channel
 
-假设 Go 没有 channel。你想让一个 worker 算完把结果交给 main，只能这样：
+并发程序需要把数据（结果、任务、信号）从**一个 goroutine 交给另一个**，还要能明确表达**不会再有数据了**，好让接收方知道何时退出。用共享内存做这两件事很麻烦：得额外维护一个标志位、再轮询它，既费 CPU 又加延迟；而且**有过数据**和**不会再有数据**是两回事，一个布尔量说不清后者。
 
-```go
-var (
-    mu      sync.Mutex
-    result  int
-    hasData bool
-)
-
-func worker() {
-    v := compute()
-    mu.Lock()
-    result = v
-    hasData = true
-    mu.Unlock()
-}
-
-func main() {
-    go worker()
-    for { // 轮询
-        mu.Lock()
-        ok := hasData
-        mu.Unlock()
-        if ok {
-            break
-        }
-        time.Sleep(time.Millisecond) // 要么浪费 CPU，要么增加延迟
-    }
-}
-```
-
-这个方法能跑，但暴露了三个问题：
-
-1. **有数据了这件事本身要靠一个额外变量和时间轮询来表达。** 延迟和 CPU 消耗二选一。
-2. **多个 worker 时没法直接扩展**：得加计数、加锁、再判断。
-3. **没法表达任务结束了**：`hasData` 只能说明**有过数据**，不能说明**不会再有数据了**。
-
-channel 把**通信**做成了语言的一等公民，Go 推崇的写法是：
+`channel` 负责的正是这件事：它是一条**带类型的管道**。Go 推崇的写法是：
 
 > **不要通过共享内存来通信，而要通过通信来共享内存。**
 
-`channel` 是一条**带类型的管道**，同时具备四个属性：
+`channel` 同时具备四个属性：
 
 | 属性 | 含义 | 带来的能力 |
 | --- | --- | --- |
@@ -214,18 +179,15 @@ ch := make(chan int)      // 无缓冲：容量为 0
 buf := make(chan int, 3)  // 有缓冲：容量为 3
 ```
 
-为什么必须用 `make`？回想第二课的 `make` vs `new`：`make` 负责初始化那些**需要内部结构**的类型（切片、map、channel）。channel 内部有一把锁、一个等待接收者队列、一个等待发送者队列和（可能的）缓冲区，用零值当不了用：
+为什么必须用 `make`？回想第二课的 `make` vs `new`：`make` 负责初始化那些**需要内部结构**的类型（切片、map、channel）。channel 内部有一把锁、一个等待接收者队列、一个等待发送者队列和（可能的）缓冲区，用零值无法使用：
 
 ```go
 var ch chan int // nil channel
 ch <- 1         // 永久阻塞
 ```
 
-**缓冲区到底解决什么问题。** 无缓冲 channel 要求发送和接收**同时就位**，它把两个 goroutine 的节奏焊死在一起。有缓冲 channel 则允许发送方在缓冲区没满时先走一步，从而：
+**缓冲区解决什么问题。** 无缓冲 channel 要求发送和接收**同时就位**，有缓冲 channel 则允许发送方在缓冲区没满时先走一步，从而削减短期峰值，减少调度次数，但是不能解决收发速度差异，发送稳定快于接受仍会阻塞。
 
-- 削峰：消费端偶尔慢一点，不至于立刻把生产端卡住；
-- 减少调度：一批小数据不用每一条都做一次**交接**；
-- 但**不解决根本的速率差**：生产长期快于消费，缓冲区迟早会满，发送照样阻塞。
 
 | 类型 | 发送阻塞条件 | 接收阻塞条件 | `cap` | 典型用途 |
 | --- | --- | --- | --- | --- |
@@ -254,35 +216,20 @@ fmt.Println(len(ch), cap(ch)) // 1 3
 | `v, ok := <-ch` | 接收并判断是否已关闭 | 区分**零值**和**已关闭** |
 | `<-ch` | 只接收，丢弃值 | 只关心**事件发生了**，例如等一个信号 |
 
-`ok` 这个返回值为什么必须存在？因为接收一个已关闭的 channel **不会报错**，它立刻返回零值。看这段代码：
+`ok` 这个返回值为什么必须存在？因为接收一个已关闭的 channel **不会报错**，它立刻返回零值：
 
 ```go
 func consume(in <-chan int) {
     for {
         v := <-in
-        if v == 0 { // 想用 0 当作结束标记
-            return
+        if v == 0 { 
+            handle（v）//如果零值是某个业务条件会误触发
         }
-        handle(v)
+
     }
 }
 ```
 
-如果上游真的发来一个 `0`，这个函数就提前退出了。正确做法是让**结束**由 `close` 表达，而不是占用一个业务值：
-
-```go
-func consume(in <-chan int) {
-    for {
-        v, ok := <-in
-        if !ok { // channel 已关闭且数据取完
-            return
-        }
-        handle(v)
-    }
-}
-```
-
-这段其实就是 `for v := range in` 展开后的样子，所以日常写 `range` 就够了（见第 8 小节）。
 
 ### 4. 通道方向：`chan<- T` 与 `<-chan T`
 
@@ -304,34 +251,15 @@ func consume(in <-chan int)  { v := <-in; _ = v } // 只能接收
 
 ### 5. `nil` channel：不是 bug，是特性
 
-`nil` channel 的发送和接收会**永久阻塞**，`close(nil)` 会 panic。听起来像陷阱，但它有一个非常重要的用途：**在 `select` 中禁用某个分支**。
+`nil` channel 的发送和接收会**永久阻塞**，`close(nil)` 会 panic。
 
-```go
-func merge2(a, b <-chan int, out chan<- int) {
-    for a != nil || b != nil {
-        select {
-        case v, ok := <-a:
-            if !ok {
-                a = nil // 第一个源读完了，从此这个 case 永远不会被选中
-                continue
-            }
-            out <- v
-        case v, ok := <-b:
-            if !ok {
-                b = nil
-                continue
-            }
-            out <- v
-        }
-    }
-}
-```
+这个特性本身就有用：一个永远阻塞的 channel 恰好表示**一个永远不触发的分支**。读完一个数据源后把它置为 `nil`，就能让后续只从剩下的源取数据——不需要额外的布尔标志，也不用写两遍循环，这是**用数据流的状态控制控制流**的典型手法。
 
-把 `a` 置为 `nil` 之后，`case v, ok := <-a` 变成一个永远不就绪的分支，`select` 自然只从 `b` 上取——不需要额外的布尔标志，也不需要写两遍循环。这是**用数据流的状态控制控制流**的典型手法。
+要真正用上它得配合 `select`：`select` 会跳过永远不就绪的 `case`，于是把某个源设为 `nil` 就等于**关掉它的分支**。具体写法见第三部分。
 
 ### 6. 关闭通道：`close()` 的完整语义
 
-**为什么需要关闭。** 没有 `close`，接收方永远无法区分两种情况：**上游暂时没有数据**和**上游永远不会再有数据**。它只能靠约定（发一个哨兵值，例如上面的 `0`）、超时或者干脆不退出——这就是 goroutine 泄漏的源头。`close` 用一条语句表达**没有更多数据了**。
+**为什么需要关闭。** 没有 `close`，接收方永远无法区分两种情况：**上游暂时没有数据**和**上游永远不会再有数据**。只能靠约定（发一个哨兵值，例如上面的 `0`）、超时或者干脆不退出——这就是 goroutine 泄漏的源头。而 `close` 用一条语句表达**没有更多数据了**。
 
 完整的语义如下，这张表值得记牢：
 
@@ -385,34 +313,9 @@ func bad() {
 }
 ```
 
-多个发送方的正确写法是：让所有生产者结束后，由一个专门的 goroutine 关闭公共出口。
+多个发送方的正确写法是：**让所有生产者都结束后，由一个专门的 goroutine 关闭公共出口**。这里的关键是**等所有生产者退出**——这需要第四部分的 `sync.WaitGroup`（生产者里 `Done`，协调者的 `Wait` 返回之后再 `close`），完整写法见第七部分的 fan-in。
 
-```go
-func merge(inputs ...<-chan int) <-chan int {
-    out := make(chan int)
-    var wg sync.WaitGroup
-    wg.Add(len(inputs))
-    for _, in := range inputs {
-        go func(in <-chan int) {
-            defer wg.Done()
-            for v := range in {
-                out <- v
-            }
-        }(in)
-    }
-    go func() {
-        wg.Wait()   // 等所有生产者退出
-        close(out)  // 只有这一个 goroutine close
-    }()
-    return out
-}
-```
-
-这段代码里有三个关键点，值得逐个拆开：
-
-1. `in` 被当作**参数传入**闭包，而不是直接捕获循环变量。Go 1.22 起 `for range` 的循环变量是每轮独立的，可以不写参数；但在 1.22 之前必须这样传，否则所有 goroutine 会读到同一个（循环结束后最终的）值。写参数是兼容性更好的习惯。
-2. `wg.Wait()` 在**另一个 goroutine** 里执行。如果直接在 `merge` 里 `wg.Wait()` 再 `close`，函数就会阻塞到所有输入处理完才能返回 `out`——那就退化成同步了。
-3. `close(out)` 只可能被执行一次，因为 `wg.Wait()` 只返回一次。
+现在只需要知道，**谁生产谁关闭自己的出口公共出口只由那个唯一的协调者关闭。**
 
 ### 8. 遍历：`for range` 与 `for select` 的分工
 
@@ -421,27 +324,17 @@ func merge(inputs ...<-chan int) <-chan int {
 | `for v := range ch` | channel 关闭且取完 | 不能 | 简单消费，明确知道上游会关闭 |
 | `for { select { ... } }` | 由 `return` 决定 | 能 | 需要响应 `done` / `ctx.Done()` |
 
+消费 channel 最常见的形式就是 `range`，它会一直取到 channel 关闭且缓冲区取空：
+
 ```go
-// 简单版
 for v := range ch {
     handle(v)
 }
-
-// 完整版：能被打断
-for {
-    select {
-    case <-done:
-        return
-    case v, ok := <-ch:
-        if !ok {
-            return // 上游关闭且取完
-        }
-        handle(v)
-    }
-}
 ```
 
-一旦代码里出现**取消**，就该用 `select` 版本；反之能用 `range` 就说明这条链路是简单直线，是好代码的标志。
+它其实就是第 3 小节那个 `v, ok := <-ch` 循环的语法糖。一旦这条链路需要**能被取消**——一边收数据一边等 `done`——就得把 `range` 换成 `select` 版，写法在第三部分。
+
+反之，能用 `range` 就说明这条链路是简单直线，是好代码的标志。
 
 ### 9. channel 的五种典型用法
 
@@ -455,56 +348,32 @@ channel 不只是**传数据**，下面五种用法都来自同一套语义：
 | 计数信号量（限流） | 带缓冲 channel 当令牌桶，`sem <- struct{}{}` / `<-sem` | 限制并发数 |
 | 互斥 / 单槽缓存 | `cap = 1` 的 channel | 保护单个值、最新值缓存 |
 
-限流（信号量）的写法值得单独看，因为在真实项目里出现频率极高：
+限流（信号量）的写法值得单独看，因为在真实项目里出现频率极高：**用带缓冲的 channel 当令牌桶**，容量就是并发上限。想开工先取一个令牌，做完再还回去；令牌被取空时，后来者自动挡在取令牌那一步排队：
 
 ```go
-func limit(limit int, jobs []int) {
-    sem := make(chan struct{}, limit) // 最多同时 limit 个
-    var wg sync.WaitGroup
-    for _, job := range jobs {
-        wg.Add(1)
-        go func(job int) {
-            defer wg.Done()
-            sem <- struct{}{}        // 取令牌，满了就在这里等
-            defer func() { <-sem }() // 还令牌
-            handle(job)
-        }(job)
-    }
-    wg.Wait()
+func withSem(sem chan struct{}, job int) {
+    sem <- struct{}{}        // 取令牌：满了就在这里等
+    defer func() { <-sem }() // 还令牌，panic 路径也不会漏
+    handle(job)
 }
 ```
 
-用 `cap = 1` 的 channel 也能做互斥，但**不推荐**作为通用锁：
+创建时给定容量即可：`sem := make(chan struct{}, limit)`。要**给一批任务都套上它、并等它们全部结束**，还需要第四部分的 `sync.WaitGroup` 来计数（完整写法见第七部分的并发限流）。
 
-| 需求 | `cap=1` channel | `sync.Mutex` |
-| --- | --- | --- |
-| 加锁 / 解锁 | `ch <- struct{}{}` / `<-ch` | `Lock` / `Unlock` |
-| 非阻塞尝试加锁 | `select` + `default` 可以 | `TryLock`（1.18+） |
-| 读写锁（多读单写） | 做不到 | `RWMutex` |
-| 跨 goroutine 解锁 | 可以（这正是问题） | 可以（同样的坑） |
-| 性能 | 更差（要过调度） | 更好 |
-
+用 `cap = 1` 的 channel 也能做互斥，但**不推荐**作为通用锁，性能更差。
 ### 10. channel 的代价与边界
 
 - **每次传递都有开销**：涉及 runtime 的调度与锁，比直接读写内存慢得多。高频计数、超小数据用 `atomic` 或 `Mutex` 更合适。
-- **它解决的是通信，不是保护**。多个 goroutine 读写同一个 map 时，你不能**用 channel 保护 map**，只能把 map 的所有权收拢到一个 goroutine 里，其他人通过 channel 请求它代劳（这叫用通信代替共享）。如果做不到，就老老实实上锁。
-- **它带来两类新 bug**：发送没人接收会永久阻塞（死锁），接收方提前退出会让发送方永远卡住（goroutine 泄漏）。第三部分的 `select` + `context`，就是为了收拾这两类问题而存在的。
+- **解决了通信的问题但是不是保护**。多个 goroutine 读写同一个 map 时，你不能**用 channel 保护 map**，只能把 map 的所有权收拢到一个 goroutine 里，其他人通过 channel 请求它代劳（用通信代替共享）。如果做不到只能老老实实上锁。
+- **它带来两类新 bug**：发送没人接收会永久阻塞（死锁），接收方提前退出会让发送方永远卡住（goroutine 泄漏）。第三部分的 `select` + `context`，就是为了解决这个问题。
 
 ---
 ## 三、select：同时等多个事件
 
 ### 1. 为什么需要 select
 
-一个 worker 通常有两个等待对象：**新任务来了要处理**，**收到取消要退出**。只有 channel 没有 `select` 时，你只有三条路：
-
-| 笨办法 | 问题 |
-| --- | --- |
-| 阻塞在一个 channel 上 | 无法同时响应取消，退出只能靠上游关闭 |
-| `for` 循环 + `default` 轮询 | 忙等，把 CPU 烧在一个什么都不做的循环上 |
-| 为每个 channel 各开一个 goroutine，转发到同一个 channel | 多出一层 goroutine，而这些**搬运工**自己也需要退出条件 |
-
-`select` 把**多路等待**做成一条语句，并且直接由 runtime 实现——**它不会为每个 `case` 创建 goroutine**。
-
+一个 worker 常常要**同时等好几个事件**：新任务来了要处理，收到取消要退出。只有 `channel` 时这很难两全——阻塞在一个 channel 上就没法再响应取消。
+`select` 负责的就是**同时等多路事件**：它把多路等待做成一条语句，直接由 runtime 实现
 ### 2. 语义要点
 
 ```go
@@ -521,12 +390,35 @@ default:
 | 规则 | 说明 |
 | --- | --- |
 | `case` 必须是 channel 操作 | 接收或发送，普通表达式不行 |
-| 多个 `case` 同时就绪 | **伪随机**选一个执行（防止某个 case 永远被饿死） |
+| 多个 `case` 同时就绪 | **伪随机**选一个执行（防止某个 case 永远等待） |
 | 都不就绪 | 阻塞等待；若有 `default`，立刻执行 `default` 并结束 |
-| `nil` channel 的 `case` | 永远不就绪 → 可用于动态禁用分支（见第二部分第 5 小节） |
+| `nil` channel 的 `case` | 永远不就绪 → 可用于动态禁用分支（见下例） |
 | `case` 的求值 | 进入 `select` 时先求出所有 channel 操作数，再判断就绪 |
 | `select {}` | 永久阻塞（如果所有 goroutine 都阻塞，runtime 会报 `fatal error: all goroutines are asleep - deadlock!`） |
 | `break` | 只跳出 `select`，不会跳出外层 `for` |
+
+**`nil` channel 的用法**：把某个 `case` 的 channel 置为 `nil`，这个分支就永远不会被选中，等于**动态关掉它**。合并两个数据源时特别顺手——读完一个就把它设 `nil`，剩下的继续读：
+
+```go
+func merge2(a, b <-chan int, out chan<- int) {
+    for a != nil || b != nil {
+        select {
+        case v, ok := <-a:
+            if !ok {
+                a = nil // 第一个源读完了，从此这个 case 永远不会被选中
+                continue
+            }
+            out <- v
+        case v, ok := <-b:
+            if !ok {
+                b = nil
+                continue
+            }
+            out <- v
+        }
+    }
+}
+```
 
 **伪随机**这条规则有一个重要推论：**不要依赖 `case` 的书写顺序。** 想要**取消优先于处理**，必须写两段 `select`：
 
@@ -559,8 +451,9 @@ for {
 
 ### 4. 超时：`time.After`、`time.NewTimer`、`time.Ticker`
 
-**为什么需要超时。** 网络对端可能永远不回应，数据库可能锁住，第三方接口可能挂起。没有超时，这次等待就会永久占用一个 goroutine、一个连接、一段内存；调用链上游也会跟着挂起，最后整条链路都被拖死——这是生产环境最常见的故障形态之一。
+**为什么需要超时** 
 
+网络对端可能永远不回应，数据库可能锁住，第三方接口可能挂起。有些不确定有没有结果的等待任务仍需要一个默认情况，这就是超时的作用。
 ```go
 select {
 case v := <-results:
@@ -577,14 +470,14 @@ case <-time.After(500 * time.Millisecond):
 | `time.NewTicker(d)` | 每隔 d 发一次，可 `Stop()` | 周期任务，如心跳、定时刷新 |
 | `context.WithTimeout` | 把超时沿调用链传下去 | 真正解决**让上游停下来**的问题 |
 
-两个必须说清的陷阱：
+两个必要的提醒：
 
-1. **`time.After` 不适合放在热循环里**（例如每秒几十万次的分支判断）。每次都会创建一个定时器对象；Go 1.23 起未被引用的定时器可以被 GC 回收，压力比过去小，但**为一次判断造一个定时器**本身仍是浪费。这种位置用 `time.NewTimer` + `Reset` 或直接把超时提出去。
-2. **超时只结束**这次等待**，不会终止对方的工作。** 上面那段代码在超时后直接返回，但产生 `results` 的 goroutine 仍然在跑。想要它停下来，必须把取消信号传进去——这就是下一小节的事。
+1. **`time.After` 不适合放在热循环里**（如每秒几十万次的分支判断）。每次都会创建一个定时器对象，这种位置用 `time.NewTimer` + `Reset` 或直接把超时提出去。
+2. 超时只结这次等待，**不会终止对方的工作。** 示例代码在超时后直接返回，但产生 `results` 的 goroutine 仍然在跑。想要它停下需要把取消信号传进去，这是下一小节的事。
 
 ### 5. 取消：`done` channel 与 `context.Context`
 
-Go **没有** **杀死一个 goroutine** 的 API，这是刻意的设计：goroutine 可能正持有锁、正在写共享状态、正在写文件，被强行中断会留下不一致的数据；而且它的栈由 runtime 管理，外部无法安全地把它撕掉。所以 Go 的取消是**协作式**的：
+Go **没有** **杀死一个 goroutine** 的 API，这是刻意的设计：goroutine 可能正持有锁、正在写共享状态、正在写文件，被强行中断会留下不一致的数据；而且它的栈由 runtime 管理，外部无法安全地把它关掉。所以 Go 的取消是**协作式**的：
 
 > 取消 = 通知 + 对方自己检查并退出。
 
@@ -611,7 +504,7 @@ func worker(done <-chan struct{}, jobs <-chan int, results chan<- int) {
 }
 ```
 
-注意内层那个 `select`：**发送也要能被取消**。如果没有它，当没有消费者时，worker 会永久阻塞在 `results <-` 上，`done` 也救不了它——这是最常见的泄漏形态。
+注意内层那个 `select`：**发送也要能被取消**。如果没有它，当没有消费者时，worker 会永久阻塞在 `results <-` 上，`done` 也无法解决，这是最常见的泄漏形态。
 
 手写 `done` 能表达**停**，但表达不了**为什么停**、**什么时候停**：
 
@@ -709,15 +602,7 @@ func run(ctx context.Context, jobs []int) []int {
 
 ### 1. 为什么需要 WaitGroup
 
-**等一组 goroutine 全部结束**这个需求，手动实现有三种做法，各有各的毛病：
-
-| 手写方案 | 问题 |
-| --- | --- |
-| `time.Sleep` | 不知道要睡多久，只是赌 |
-| 每个 worker 完成后往一个 channel 发一个值，主 goroutine 收 n 个 | 可行，但要预先知道 n；收完之后如果还有人不退出也无法察觉 |
-| `atomic` 计数 + 忙等 | 烧 CPU；等待逻辑自己写容易错 |
-
-`WaitGroup` 就是第三种做法的正确实现：一个**计数器**加一个**等待队列**。它恰好描述了我们能说清的那部分信息——**我不知道谁先结束，但我知道一共有几个**。
+启动了一组 goroutine，就需要知道**它们什么时候全部结束**，以便进行后续的业务。`WaitGroup` 负责的就是**等待一组 goroutine 结束**：一个**计数器**加一个**等待队列**。它描述了我们已知的信息，**不知道谁先结束，但知道一共有几个**。
 
 ### 2. 三个方法（外加一个新方法）
 
@@ -732,13 +617,13 @@ func run(ctx context.Context, jobs []int) []int {
 func main() {
     var wg sync.WaitGroup
     for i := 0; i < 3; i++ {
-        wg.Add(1)
+        wg.Add(1)//新建goroutine时计数+1
         go func(id int) {
-            defer wg.Done() // 放在第一行，任何 return 路径都不会漏
+            defer wg.Done() //本协程结束自动释放使计数-1
             fmt.Println("worker", id, "done")
         }(i)
     }
-    wg.Wait()
+    wg.Wait()//阻塞直到计数器归零
     fmt.Println("all workers finished")
 }
 ```
@@ -746,18 +631,18 @@ func main() {
 状态机很简单，但它解释了所有规则：
 
 ```text
-        Add(n)                      Done() 使计数归零
-  0 ─────────────►  n  ─────────────────────────────►  Wait() 返回
-  │                 │
-  │ Wait() 立刻返回  │ Wait() 在这里阻塞
-  │                 │
-  └─────────────────┘
+        Add(n)                  Done() 使计数归零
+  0 ────────────────────►  n  ──────────────────────►  Wait() 返回
+  │                         │
+  │ Wait() 立刻返回          │ Wait() 在这里阻塞
+  │                         │
+  └─────────────────────────┘
   计数不能为负：Done 多于 Add 会 panic
 ```
 
-### 3. 五条硬规则
+### 3. 五条规则
 
-| 规则 | 违反的后果 |
+| 规则 | 违反后果 |
 | --- | --- |
 | `Add` 要在启动 goroutine **之前**调用 | `Wait` 可能在计数还是 0 时提前返回，程序**没等就结束了** |
 | `Add(1)` 与 `Done()` 必须一一对应 | 少一次 `Done` 就永久阻塞；多一次 `Done` 会 `panic: sync: negative WaitGroup counter` |
@@ -769,18 +654,17 @@ func main() {
 
 ```go
 for i := 0; i < 3; i++ {
-    go func() {
-        wg.Add(1) // 错：可能还没执行到，Wait 已经返回了
+    go func() {//创建了goroutine，同时 Wait 开始
+        wg.Add(1) // 可能还没执行到计数器增加，Wait 已经返回了
         defer wg.Done()
         work()
     }()
 }
 wg.Wait()
 ```
+**计数从 0 变成正数必须发生在 `Wait` 可能看到 0 之前**。所以习惯上把 `Add` 放在 `go` 之前，由启动者负责计数，goroutine 只负责 `Done`。
 
-**`Add` 必须在 `Wait` 之前**这句话的精确版本是：**计数从 0 变成正数这件事，必须发生在 `Wait` 可能看到 0 之前**。所以习惯上把 `Add` 放在 `go` 之前，由启动者负责计数，goroutine 只负责 `Done`。
-
-Go 1.25 的 `wg.Go` 把这三件事合成一件，从根上消灭了**忘写 `Done`**和**`Add` 放错位置**两个错误：
+Go 1.25 的 `wg.Go` 把这三件事合成一件，从根上解决了**忘写 `Done`**和**`Add` 放错位置**两个错误：
 
 ```go
 var wg sync.WaitGroup
@@ -792,20 +676,8 @@ for _, job := range jobs {
 wg.Wait()
 ```
 
-> 用它之前先确认工具链版本（`go version`）。在旧版本上它不存在，本课程的练习仍以 `Add`/`Done`/`Wait` 为主——这三个是必须掌握的，`Go` 只是更省事的写法。
 
-### 4. 特点与边界
-
-`WaitGroup` 只做一件事，这也决定了它的边界：
-
-| 它负责 | 它不负责 |
-| --- | --- |
-| 等待一组 goroutine 结束 | 传递结果（用 channel） |
-| 计数 | 取消任务（用 `context`） |
-| —— | 保护共享内存（用锁） |
-| —— | 等待**第一个完成**（用 channel） |
-
-还有一点容易被忽略：**`Wait` 等的是最慢的那个**。一个 worker 卡住，整组都等不到齐。所以真实的批量任务通常写成**等，但最多等 3 秒**——这就需要把 `Wait` 和一个 channel 组合起来：
+还有一点容易被忽略：**`Wait` 等的是最慢的那个**。一个 worker 卡住整组都等不到结束。所以真实的批量任务通常写成**等，但最多等一段时间**——这就需要把 `Wait` 和一个 channel 组合起来：
 
 ```go
 func waitTimeout(wg *sync.WaitGroup, d time.Duration) bool {
@@ -823,58 +695,18 @@ func waitTimeout(wg *sync.WaitGroup, d time.Duration) bool {
 }
 ```
 
-### 5. 组合用法
-
-**（1）多个生产者汇聚到一个出口**：第四部分开头的 `merge`。
-
-**（2）按下标写结果，不加锁**。`append` 是读-改-写，多个 goroutine 并发 `append` 同一个切片是数据竞争；预分配 + 按下标写就完全不用锁：
-
-```go
-func fanOut(jobs []int, workers int) []int {
-    partial := make([]int, workers) // 每个 worker 一个固定槽位
-    var wg sync.WaitGroup
-    wg.Add(workers)
-    for i := 0; i < workers; i++ {
-        go func(idx int) {
-            defer wg.Done()
-            sum := 0
-            for _, job := range jobs {
-                sum += job
-            }
-            partial[idx] = sum // 各写各的槽位，互不干扰
-        }(i)
-    }
-    wg.Wait()
-    return partial
-}
-```
-
-这个手法在真实项目里非常常用：只要做到**每个 goroutine 只写属于自己的那份**，就不需要任何锁。反过来，如果连下标都可能撞车（例如结果条数不定），就得回到 channel 或 `Mutex`。
-
-**（3）与 `context` 组合**：`WaitGroup` 只告诉你**完了**，`context` 告诉你**该停了**，两者一起用构成第七部分的批量任务模式。
-
 ---
 
 ## 五、锁：保护共享内存
 
 ### 1. 为什么需要锁
 
-`channel` 传递的是**值**，但有些状态天生就是**共享的**：一个服务里的配置、一个缓存 map、一个连接池、一个累计计数器。这些数据不属于某一个 goroutine，它们被多方读写，此时用 channel 传递是别扭的。
+`channel` 传递的是**值**，但有些状态天生就是**共享的**：一个服务里的配置、一个缓存 map、一个连接池、一个累计计数器。这些数据不属于某一个 goroutine，它们被多方读写，此时用 channel 传递并不合适。
 
-没有锁，共享内存会以三种方式出错：
+没有锁，共享内存会以三种方式出错：**更新丢失**（两个 goroutine `n++`，结果少了）、**结构损坏**（并发写同一个 map 直接 `fatal error: concurrent map writes`，进程退出）、**读到中间状态**（一个 goroutine 更新 `{账号, 余额}` 两个字段时，另一个只读到了半个更新的值，极难复现）。
 
-| 现象 | 例子 | 严重程度 |
-| --- | --- | --- |
-| 更新丢失 | 两个 goroutine `n++`，结果少了几千 | 静默错误，最危险 |
-| 结构损坏 | 两个 goroutine 同时写一个 map | `fatal error: concurrent map writes`，进程直接退出 |
-| 读到中间状态 | 一个 goroutine 更新 `{账号, 余额}` 两个字段，另一个读到一半新的 | 业务逻辑错乱，极难复现 |
+锁提供的正是两件事：**互斥**和**顺序**。互斥是同一时刻只有一个 goroutine 在临界区里；顺序是上锁后，后面要上锁的goroutine必须等前者完成，于是建立一条 happens-before ，临界区里的普通读写因此变得可见、有序。
 
-锁提供了两件事：
-
-1. **互斥**：同一时刻只有一个 goroutine 在临界区里。
-2. **顺序**：`Unlock()` 之后的 `Lock()` 必须等到前者完成，于是建立了一条 happens-before 边——临界区里的普通读写因此变得可见、有序。
-
-第二点比第一点更本质。常见的误解是**锁只是防止同时写**，其实**读也必须在同一把锁的保护范围内**：读不到最新值，前面那些写就等于没发生。
 
 ### 2. `sync.Mutex` 的全部能力
 
@@ -907,7 +739,7 @@ func (c *Counter) Value() int {
 
 | 特性 | 说明 | 不理解的后果 |
 | --- | --- | --- |
-| 零值可用 | `var mu sync.Mutex` 就能用，不需要 `New` | 多余地写 `sync.NewMutex()` |
+| 零值可用 | `var mu sync.Mutex` 就能用，不需要 `New` | ---|
 | 不可重入 | 同一个 goroutine 重复 `Lock` 会自己把自己锁死 | 程序在 `sync.Mutex.Lock` 上卡住，runtime 报 `fatal error: all goroutines are asleep - deadlock!` |
 | 不绑定 goroutine | A goroutine 加锁、B 解锁在语法上允许 | 误以为**锁属于某个 goroutine**，写出混乱的解锁逻辑 |
 | 不可复制 | 锁内部有状态，复制会得到两把独立的锁 | `go vet` 报 `copylocks`；两个**同一把锁**实际不互斥 |
@@ -1363,6 +1195,12 @@ func merge(inputs ...<-chan int) <-chan int {
 | 没有 `WaitGroup` | 不知道什么时候所有输入都排空了，`close(out)` 无从下手 |
 | 在每个生产者里 `close(out)` | 第二个生产者也 close 时 panic |
 | 在 `merge` 里直接 `wg.Wait()` | 函数阻塞到全部处理完才返回，失去了**边跑边消费**的意义 |
+
+这段代码还有三个关键点，值得逐个拆开：
+
+1. `in` 被当作**参数传入**闭包，而不是直接捕获循环变量。Go 1.22 起 `for range` 的循环变量是每轮独立的，可以不写参数；但在 1.22 之前必须这样传，否则所有 goroutine 会读到同一个（循环结束后最终的）值。写参数是兼容性更好的习惯。
+2. `wg.Wait()` 在**另一个 goroutine** 里执行。如果直接在 `merge` 里 `wg.Wait()` 再 `close`，函数就会阻塞到所有输入处理完才能返回 `out`——那就退化成同步了。
+3. `close(out)` 只可能被执行一次，因为 `wg.Wait()` 只返回一次。
 
 **顺序会变**：fan-out 之后结果的到达顺序不再等于输入顺序。如果要保序，见第 5 小节。
 
