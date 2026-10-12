@@ -149,12 +149,12 @@ for i := 0; i < 3; i++ {
 
 `channel` 同时具备四个属性：
 
-| 属性 | 含义 | 带来的能力 |
-| --- | --- | --- |
-| 类型化 | `chan T` 只能传 `T` | 不需要类型断言，编译期就能查错 |
-| 同步点 | 发送和接收构成一次配对 | 天然建立了 happens-before |
-| 可关闭 | 关闭是一个**对所有接收者同时生效**的信号 | 广播，且能表达**没有更多数据了** |
-| 有容量 | 无缓冲 / 有缓冲 | 决定生产者能跑多快、要不要等消费者 |
+| 属性 | 含义 |
+| --- | --- | 
+| 类型化 | `chan T` 只能传 `T` |
+| 同步点 | 发送和接收构成一次配对 | 
+| 可关闭 | 关闭是一个**对所有接收者同时生效**的信号 | 
+| 有容量 | 无缓冲 / 有缓冲 |
 
 ### 2. 创建 channel：`make(chan T)` 与 `make(chan T, n)`
 
@@ -270,6 +270,8 @@ for i := 0; i < 5; i++ {
     }()
 }
 close(done) // 一条语句唤醒全部
+
+time.Sleep(time.Second) // 只是为了让上面那 5 行打印出来——main 一返回，它们就会像第一部分那样被静默杀死
 ```
 
 对比一下**发送一个值来通知**的做法：
@@ -282,7 +284,7 @@ close(done) // 一条语句唤醒全部
 
 ### 7. 谁有权关闭：所有权规则
 
-`close` 会 panic 的两条规则（重复关闭、向已关闭发送）都指向同一个结论：
+`close` 的两条 panic 规则指向同一个结论：
 
 > **由发送方关闭，接收方永远不关闭；有多个发送方时，由统一的协调者关闭。**
 
@@ -349,7 +351,7 @@ func withSem(sem chan struct{}, job int) {
 ### 10. channel 的代价与边界
 
 - **每次传递都有开销**：涉及 runtime 的调度与锁，比直接读写内存慢得多。高频计数、超小数据用 `atomic` 或 `Mutex` 更合适。
-- **它带来两类新 bug**：发送没人接收会永久阻塞（死锁），接收方提前退出会让发送方永远卡住（goroutine 泄漏）。第三部分的 `select` + `context`，就是为了解决这个问题。
+- **它带来两类新 bug**：发送没人接收会永久阻塞（死锁），接收方提前退出会让发送方永远卡住（goroutine 泄漏）——解决办法见第三部分。
 
 ---
 ## 三、select：同时等多个事件
@@ -432,7 +434,6 @@ for {
 | `select { case v := <-ch: default: }` | 非阻塞尝试，拿不到就走 | **有就取**、丢旧值 |
 | `select { case <-time.After(d): }` | 等一个**定时事件** | 超时 |
 | `select { case <-ctx.Done(): }` | 等一个**已取消**事件 | 取消、优雅关闭 |
-| `for { select { ... } }` | 事件循环 | worker 主体 |
 
 ### 4. 超时：`time.After`、`time.NewTimer`、`time.Ticker`
 
@@ -452,7 +453,6 @@ case <-time.After(500 * time.Millisecond):
 | `time.After(d)` | 返回一个 `<-chan Time`，d 后收到一个值 | 写法最省事；每次调用都会创建一个定时器 |
 | `time.NewTimer(d)` | 返回 `*Timer`，可 `Stop()` / `Reset()` | 需要提前结束或复用定时器时用 |
 | `time.NewTicker(d)` | 每隔 d 发一次，可 `Stop()` | 周期任务，如心跳、定时刷新 |
-| `context.WithTimeout` | 把超时沿调用链传下去 | 真正解决**让上游停下来**的问题 |
 
 两个必要的提醒：
 
@@ -515,21 +515,13 @@ func worker(done <-chan struct{}, jobs <-chan int, results chan<- int) {
 | `ctx.Deadline()` | 是否设了截止时间、什么时候到 |
 
 ```go
-func fetch(ctx context.Context) error {
-    req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-    if err != nil {
-        return err
-    }
-    _, err = http.DefaultClient.Do(req)
-    return err
-}
-
 ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 defer cancel() // 必须调用，否则计时器与子 context 无法释放
-if err := fetch(ctx); err != nil {
-    if errors.Is(err, context.DeadlineExceeded) {
-        // 超时，不是别的错
-    }
+
+doSomething(ctx) // HTTP / 数据库这些库的第一个参数都是 ctx，取消会一路传下去
+
+if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+    // 超时，不是别的错
 }
 ```
 
@@ -824,7 +816,7 @@ once.Do(func() { init() })  // 并发调用下只执行一次
 ---
 ## 七、组合：把工具拼起来能得到什么
 
-前面六部分讲的是零件。真实的并发功能都是**组合**出来的，而且组合方式相当固定——下面这四种覆盖了绝大多数场景。这一节对每个功能都给出三件事：**要实现什么**、**组合了哪些 API**、**代码**，最后用一句话点出**少了某个零件会怎样**。
+前面六部分讲的是零件。真实的并发功能都是**组合**出来的，而且组合方式相当固定——下面这五种覆盖了绝大多数场景。这一节对每个功能都给出三件事：**要实现什么**、**组合了哪些 API**、**代码**，最后用一句话点出**少了某个零件会怎样**。
 
 
 ### 1. 流水线（pipeline）
@@ -902,7 +894,7 @@ func merge(inputs ...<-chan int) <-chan int {
 }
 ```
 
-`close(out)` 只能有一个执行者（第二次 close 就 panic）；`wg.Wait()` 必须放在**另一个** goroutine 里，否则函数会阻塞到全部处理完才返回；`in` 最好当参数传进闭包（Go 1.22 之前循环变量会被所有 goroutine 共享）。**顺序会变**——fan-out 之后结果到达顺序不再等于输入顺序；要保序，就在收集侧把结果按下标写回预先分配的切片。
+`close(out)` 只能有一个执行者（第二次 close 就 panic）；`wg.Wait()` 必须放在**另一个** goroutine 里，否则函数会阻塞到全部处理完才返回；`in` 最好当参数传进闭包（Go 1.22 之前循环变量会被所有 goroutine 共享）。**顺序会变**——fan-out 之后结果到达顺序不再等于输入顺序；要保序，就把结果按下标写回预先分配的切片（写法见第 4 小节）。
 
 ### 3. 固定 worker 数量的任务池
 
@@ -971,7 +963,7 @@ func run(ctx context.Context, jobs []int, workerCount int) []Result {
 }
 ```
 
-三个关闭点必须各自分清：`close(jobCh)` 由**投递者**做（只有它知道没有更多任务了），`close(resultCh)` 由 `wg.Wait()` 之后的**协调者**做（只有它知道所有 worker 都停了），`ctx` 的 `cancel()` 由**调用方**做——写错的后果都是 panic 或泄漏。结果顺序不确定，谁先算完谁先发。有序化要在收集侧把结果按下标写回预先分配的切片。
+三个关闭点必须各自分清：`close(jobCh)` 由**投递者**做（只有它知道没有更多任务了），`close(resultCh)` 由 `wg.Wait()` 之后的**协调者**做（只有它知道所有 worker 都停了），`ctx` 的 `cancel()` 由**调用方**做——写错的后果都是 panic 或泄漏。结果顺序不确定，谁先算完谁先发；要保序见第 4 小节。
 
 ### 4. 并发限流（信号量）
 
@@ -994,6 +986,8 @@ func limited(jobs []int, limit int) []int {
     return out
 }
 ```
+
+顺带一提：`out[i] = compute(job)` 这个写法**天然保序**——每个任务只写自己那一格，结果顺序与输入顺序一致，不需要额外的锁或排序。
 
 和固定 worker 任务池的区别只有一问：**任务源源不断**（队列式）用任务池，**任务数不算巨大但要独占外部资源**用信号量。信号量里每个任务仍是一个 goroutine，只是被挡住，任务量极大时仍要小心；要在等令牌时也能取消，就把 `select` 写在取令牌那一步。
 
@@ -1054,7 +1048,7 @@ func limited(jobs []int, limit int) []int {
 | 并发请求第三方接口，限制并发 | 信号量（带缓冲 channel） | 保护下游 |
 | 加载一次配置 | `Once` + `atomic.Pointer` | 只做一次 + 无锁读 |
 | 批量任务，最多等 3 秒 | `context.WithTimeout` + `WaitGroup` | 需要可中断 |
-| 服务退出 | `close(done)` + `WaitGroup` | 广播 + 计数 |
+| 服务退出 | `close(done)` + `WaitGroup` | 广播 + 计数（骨架见第七部分第 5 小节） |
 | 一个连接池 | `Cond` 或带缓冲 channel | 等**有空闲**条件 |
 
 ---
@@ -1076,6 +1070,7 @@ func limited(jobs []int, limit int) []int {
 
 ### 2. 提交前的四问
 
+写并发代码时，这四句话能挡掉绝大多数事故；提交时在 PR 描述里逐条写下答案：
 
 1. 每个 channel 的发送方、接收方、关闭方分别是谁？
 2. 每个 goroutine 靠什么退出？每个阻塞点会被谁唤醒？
@@ -1136,7 +1131,7 @@ func (p *Pool) Results() <-chan Result
 func (p *Pool) Shutdown(ctx context.Context) error
 ```
 
-要求：
+要求（骨架可参考第七部分第 3、5 小节）：
 
 - 指定 worker 数量，并发数不超过它；
 - `Submit` 之后可以通过 channel 收集结果；
@@ -1155,11 +1150,9 @@ func (p *Pool) Shutdown(ctx context.Context) error
 | 工具 | 没有它会怎样 | 它建立的保证 |
 | --- | --- | --- |
 | `channel` | 数据传不出来，结束无法表达 | 发送 → 接收 的顺序；`close` 广播**没有更多了** |
-| `select` | 只能等一个事件，无法超时 | 多路等待，`default` 为非阻塞 |
-| `context` | 无法取消，goroutine 越积越多 | 广播**该停了**，并携带截止时间 |
+| `select` / `context` | 只能等一个事件；无法取消，goroutine 越积越多 | 多路等待、`default` 非阻塞；广播**该停了**并带截止时间 |
 | `WaitGroup` | 不知道一组任务何时结束 | `Done` → `Wait` 的顺序 |
 | `Mutex` / `RWMutex` | 共享内存被并发读写，结果错或崩溃 | 互斥 + `Unlock` → `Lock` 的顺序 |
-| `Once` / `atomic` | 初始化重复、单变量也要锁 | 只执行一次；单变量的原子读写 |
 
 
 下一课开始，这些工具会从**练习题**变成**业务代码的一部分**：处理一个 HTTP 请求要用 `context` 传递取消和超时，访问数据库要通过连接池限制并发，返回结果要经过一层层 `channel` 或锁保护的缓存。有很多业务代码因为需求都有高度结构化和相似的内容，理解并熟练掌握本节课的内容会对以后的业务编写（或者单纯阅读理解ai的代码）有很大帮助
