@@ -315,7 +315,7 @@ func bad() {
 
 多个发送方的正确写法是：**让所有生产者都结束后，由一个专门的 goroutine 关闭公共出口**。这里的关键是**等所有生产者退出**——这需要第四部分的 `sync.WaitGroup`（生产者里 `Done`，协调者的 `Wait` 返回之后再 `close`），完整写法见第七部分的 fan-in。
 
-现在只需要知道，**谁生产谁关闭自己的出口公共出口只由那个唯一的协调者关闭。**
+现在只需要知道：**谁生产谁关闭自己的出口；公共出口只由那个唯一的协调者关闭。**
 
 ### 8. 遍历：`for range` 与 `for select` 的分工
 
@@ -708,7 +708,7 @@ func waitTimeout(wg *sync.WaitGroup, d time.Duration) bool {
 锁提供的正是两件事：**互斥**和**顺序**。互斥是同一时刻只有一个 goroutine 在临界区里；顺序是上锁后，后面要上锁的goroutine必须等前者完成，于是建立一条 happens-before ，临界区里的普通读写因此变得可见、有序。
 
 
-### 2. `sync.Mutex` 的全部能力
+### 2. `sync.Mutex`
 
 ```go
 type Counter struct {
@@ -729,85 +729,44 @@ func (c *Counter) Value() int {
 }
 ```
 
-| 方法 | 作用 | 备注 |
-| --- | --- | --- |
-| `Lock()` | 加锁，已有人持锁则阻塞 | |
-| `Unlock()` | 解锁 | 对未加锁的 Mutex 解锁会 panic |
-| `TryLock()` | 尝试加锁，成功返回 `true` | Go 1.18+；**不阻塞**，适合**拿不到就走别的路** |
+它只有两个方法：`Lock()` 加锁（已有人持锁则阻塞）、`Unlock()` 解锁（对未加锁的 Mutex 解锁会 panic）。
 
-特性与坑，逐条对应到具体现象：
+特性与坑：
 
 | 特性 | 说明 | 不理解的后果 |
 | --- | --- | --- |
-| 零值可用 | `var mu sync.Mutex` 就能用，不需要 `New` | ---|
-| 不可重入 | 同一个 goroutine 重复 `Lock` 会自己把自己锁死 | 程序在 `sync.Mutex.Lock` 上卡住，runtime 报 `fatal error: all goroutines are asleep - deadlock!` |
-| 不绑定 goroutine | A goroutine 加锁、B 解锁在语法上允许 | 误以为**锁属于某个 goroutine**，写出混乱的解锁逻辑 |
-| 不可复制 | 锁内部有状态，复制会得到两把独立的锁 | `go vet` 报 `copylocks`；两个**同一把锁**实际不互斥 |
-| 解锁未持有的锁 | panic: `sync: unlock of unlocked mutex` | —— |
+| 零值可用 | `var mu sync.Mutex` 就能用，不需要 `New` | —— |
+| 不可重入 | 同一个 goroutine 重复 `Lock` 会把自己锁死 | 卡在 `Lock` 上，runtime 报 deadlock |
+| 不绑定 goroutine | A 加锁、B 解锁语法上允许 | 误以为**锁属于某个 goroutine**，解锁逻辑混乱 |
+| 不可复制 | 复制会得到两把独立的锁 | `go vet` 报 `copylocks`；同一把锁实际不互斥 |
 
-不可重入这一条，新手最常撞上：
-
-```go
-func (c *Counter) AddTwice(delta int) {
-    c.mu.Lock()
-    defer c.mu.Unlock()
-    c.Add(delta) // Add 里又 Lock 同一把锁 → 永久阻塞
-    c.Add(delta)
-}
-```
-
-解决方法不是换一把锁，而是**把需要锁的操作和不需要锁的内部逻辑分开**：内部函数不加锁，只在公开方法的边界上加锁。
-
-`TryLock` 也不是**更安全的 Lock**，它的语义是**拿不到就算了**：
-
-```go
-if mu.TryLock() { // 拿到就更新缓存，拿不到说明有人正在更新，跳过即可
-    defer mu.Unlock()
-    cache[key] = value
-}
-```
-
-如果代码变成 `for !mu.TryLock() {}`，那只是把你的手写轮询换了张皮。
+不可重入的解法不是换锁，而是**把需要锁的操作和不需要锁的内部逻辑分开**：内部函数不加锁，只在公开方法的边界上加锁。
 
 ### 3. 临界区怎么划
 
-临界区的定义很简单：**从 `Lock` 到 `Unlock` 之间的代码**。难点在于它该有多宽。
+临界区就是**从 `Lock` 到 `Unlock` 之间的代码**，难点在于它该有多宽：
 
 | 临界区 | 后果 |
 | --- | --- |
-| 过小：只锁了写、没锁读 | 读到旧值，等于没同步 |
-| 过小：漏掉某个字段的更新 | 出现**半个新、半个旧**的状态 |
-| 合适：刚好覆盖共享状态的读写 | 正确且并发度高 |
-| 过大：把网络请求、文件 I/O、耗时计算包进来 | 所有 goroutine 一起排队，并发退化为串行 |
+| 只锁了写、没锁读 | 读到旧值，等于没同步 |
+| 漏掉某个字段的更新 | 出现**半个新、半个旧**的状态 |
+| 把网络请求、文件 I/O、耗时计算包进来 | 所有 goroutine 一起排队，并发退化为串行 |
+| 刚好覆盖共享状态的读写 | 正确且并发度高 |
 
-```go
-// 反例：锁里做了网络请求
-mu.Lock()
-data, err := fetchFromRemote() // 可能要几百毫秒
-cache[name] = data
-mu.Unlock()
-
-// 正确：先做慢操作，只锁写回那一小段
-data, err := fetchFromRemote()
-mu.Lock()
-cache[name] = data
-mu.Unlock()
-```
-
-判断方法：问自己**这段时间里，除了我在改的那几个字段，还发生了什么**。如果答案是**一段与共享状态无关的计算或 I/O**，就应该挪出临界区。
+判断方法只有一问：**这段时间里除了我在改的那几个字段，还发生了什么**——只要包含与共享状态无关的计算或 I/O，就该挪出临界区。
 
 ### 4. 死锁：四种形态
 
-死锁在教科书上有四个必要条件，落到 Go 代码里其实就是四类写法：
+落到 Go 代码里就是四类写法：
 
 | 形态 | 例子 | 特征 |
 | --- | --- | --- |
-| 同一把锁重入 | 上面 `AddTwice` 的例子 | runtime 直接报 deadlock |
+| 同一把锁重入 | 同一个 goroutine 重复 `Lock` | runtime 直接报 deadlock |
 | 两把锁交叉 | A 持 `mu1` 等 `mu2`，B 持 `mu2` 等 `mu1` | 需要统一锁顺序 |
-| 锁与 channel 交叉 | 持锁等待 channel，而 channel 的发送方正等这把锁 | 最隐蔽 |
-| 等一个永远不会发生的事件 | 无缓冲 channel 发送没人接收；`wg.Wait()` 少一次 `Done` | 表现为**程序静静地卡住** |
+| 锁与 channel 交叉 | 持锁等待 channel，而发送方正等这把锁 | 最隐蔽 |
+| 等一个永远不会发生的事件 | 无缓冲 channel 没人接收；`wg.Wait()` 少一次 `Done` | 表现为**程序静静地卡住** |
 
-**关于 runtime 的报错要有一个清醒认识**：`fatal error: all goroutines are asleep - deadlock!` 只在**所有** goroutine 都阻塞时才会出现。只要还有一个人在跑（例如一个 HTTP 服务的其他连接还在处理请求），runtime 就不会报，程序会静默卡死。所以真正的排查手段是第七部分那个方法——**对每个阻塞点写出谁会唤醒它**：
+后两种**不会报错**（原因见第九部分），只能主动排查。方法只有一个——**对每个阻塞点写出谁会唤醒它**：
 
 ```text
 阻塞点：ch <- result
@@ -819,7 +778,7 @@ mu.Unlock()
 
 ### 5. `sync.RWMutex`：读多写少的优化
 
-`Mutex` 把并发的读也串行化了。如果一份数据**读远多于写**（配置、路由表、本地缓存），可以让多个读者同时进入：
+`Mutex` 把并发的读也串行化了。如果一份数据**读远多于写**（配置、路由表、本地缓存），可以让多个读者同时进入：读用 `RLock()` / `RUnlock()`（可被多个 goroutine 同时持有），写用 `Lock()` / `Unlock()`（独占，有读者时等待）。
 
 ```go
 type ConfigStore struct {
@@ -841,24 +800,15 @@ func (s *ConfigStore) Set(key, value string) {
 }
 ```
 
-| 方法 | 语义 |
-| --- | --- |
-| `RLock()` / `RUnlock()` | 读锁，可被多个 goroutine 同时持有 |
-| `Lock()` / `Unlock()` | 写锁，独占；有读者时等待 |
-| `TryLock()` / `TryRLock()` | 非阻塞版本（Go 1.18+） |
-
 规则与代价：
 
 | 要点 | 说明 |
 | --- | --- |
-| 读锁之间共享，读与写、写与写互斥 | 这是它唯一的收益来源 |
-| 写者优先 | 有写者等待时，新的 `RLock` 会排队，避免写者被无休止的读者饿死 |
-| **读锁不可递归** | 一个 goroutine 持 `RLock` 时再次 `RLock`，如果中间有写者插队，就是死锁 |
-| 不要默认使用 | 没有读写差异、或写也很频繁时，它比 `Mutex` 更慢（多了一层读者计数） |
-| 收益要用数据说话 | 先写基准测试（`go test -bench`）比较，再决定换不换 |
-| 同样不可复制 | 传递时用指针 |
+| 读之间共享，读与写、写与写互斥 | 唯一的收益来源 |
+| 写者优先 | 有写者等待时，新的 `RLock` 会排队，避免写者被饿死 |
+| 读锁不可递归 | 持 `RLock` 时再次 `RLock`，中间有写者插队就是死锁 |
 
-最后一条经验：**`RWMutex` 属于优化，不属于设计**。先用 `Mutex` 写出正确的代码，确认读确实是瓶颈后再换。
+一句话：**`RWMutex` 属于优化，不属于设计**。先用 `Mutex` 写出正确的代码、用 `go test -bench` 确认读确实是瓶颈，再换。
 
 ### 6. 锁还是 channel
 
@@ -883,207 +833,30 @@ func (s *ConfigStore) Set(key, value string) {
 
 前面四个工具（`WaitGroup`、`Mutex`、`RWMutex`、`channel`）是本节课必须掌握的主体。`sync` 包里还有几件工具，它们各自解决一个很具体的问题。这一节的目标是**知道它们存在、知道它们解决什么问题**，遇到对应场景时能想起来。
 
-### 1. `sync.Once`：只执行一次的初始化
+下表是它们的速览，遇到对应场景再查文档：
 
-**问题**：某个资源（数据库连接、全局配置、昂贵的索引）只需初始化一次，但要保证并发安全。手写**检查—加锁—再检查**很容易漏：先判断标志位再初始化，两个 goroutine 可能同时通过判断，初始化两次。
+| 工具 | 解决什么问题 | 关键 API | 使用要点 |
+| --- | --- | --- | --- |
+| `sync.Once` | 某资源只需初始化一次，且要并发安全 | `Do(f)`（Go 1.21+ 另有 `OnceFunc`/`OnceValue`） | `f` 里 panic 也算**已执行**，不会重试；`Once` 只管创建一次，之后的并发读写仍要锁 |
+| `sync.Map` | 读多写少、key 集合稳定的并发键值表 | `Load`/`Store`/`LoadOrStore`/`Range` | 键值是 `any`，取值要类型断言；`Range` 不是一致性快照；**默认仍用 `map` + `RWMutex`** |
+| `sync.Pool` | 高频创建/丢弃大对象，压力全给 GC | `Get`/`Put` | 对象随时可能在 GC 时被清空，拿到后**必须重置**；是**减少分配**的工具，不是缓存 |
+| `sync.Cond` | 等一个条件成立才继续 | `NewCond`/`Wait`/`Signal`/`Broadcast` | `Wait` 必须持锁调用，且必须放在 `for` 循环里重新检查条件；等条件大多已被 channel 取代 |
+| `sync/atomic` | 单个变量（计数、标志、指针）的无锁读写 | `Add`/`Load`/`Store`/`Swap`/`CompareAndSwap` | 只保证**单个变量**的原子性；多个变量的联合一致仍要锁 |
 
-```go
-var (
-    instance *DB
-    once     sync.Once
-)
-
-func GetDB() *DB {
-    once.Do(func() {
-        instance = connect() // 并发调用下只会执行一次
-    })
-    return instance
-}
-```
-
-| 要点 | 说明 |
-| --- | --- |
-| 只有一个方法 | `Do(f func())`，没有 `Undo`、不能重置 |
-| 阻塞语义 | `f` 执行期间，其他 `Do` 调用会阻塞，直到 `f` 返回；所有调用者返回后一定能看到 `f` 的结果 |
-| `f` 里 panic | 这次调用仍被记为**已执行**；后续 `Do` 不会重试（Go 1.21 起 `sync.OnceFunc` 会让每次调用都重新 panic） |
-| Go 1.21+ 的语法糖 | `OnceFunc`、`OnceValue`、`OnceValues`，省掉 `var instance` 这个全局变量 |
+Go 1.19 起提供了类型化的原子类型：`atomic.Bool`、`atomic.Int32/Int64`、`atomic.Uint32/Uint64`、`atomic.Pointer[T]`、`atomic.Value`。
 
 ```go
-getConfig := sync.OnceValue(func() *Config {
-    return loadConfig() // 只执行一次，之后直接返回缓存结果
-})
-cfg := getConfig()
+var n atomic.Int64
+n.Add(1)                    // 计数
+
+var once sync.Once
+once.Do(func() { init() })  // 并发调用下只执行一次
 ```
-
-`Once` + `Mutex` 是常见组合：`Once` 负责**只创建一次**，`Mutex` 负责**创建之后，对它的并发读写**。
-
-### 2. `sync.Map`：并发安全的键值表
-
-**问题**：普通 map 并发写会让进程直接退出，而用 `Mutex` 包一层在**读多写少、key 集合稳定**的场景下锁竞争明显。`sync.Map` 内部用两份表（read / dirty）把这个场景优化了。
-
-| 方法 | 作用 |
-| --- | --- |
-| `Store(k, v)` | 写入 |
-| `Load(k)` | 读取，返回 `(any, bool)` |
-| `LoadOrStore(k, v)` | 有则返回已有值，无则存入 |
-| `LoadAndDelete(k)` | 取出并删除，常用于**一次性消费** |
-| `Delete(k)` | 删除 |
-| `Range(f func(k, v any) bool)` | 遍历，`f` 返回 `false` 时停止 |
-| `CompareAndSwap(k, old, new)` | 比较并替换（Go 1.20+） |
-| `CompareAndDelete(k, old)` | 比较并删除（Go 1.20+） |
-| `Clear()` | 清空（Go 1.23+） |
-
-代价与限制，这几条决定了它不能当默认选择：
-
-| 限制 | 影响 |
-| --- | --- |
-| 键值类型是 `any` | 取值要类型断言，失去编译期检查 |
-| 没有长度、不能原子地**读-改-写**多个键 | 复合操作仍要额外的锁 |
-| `Range` 不保证一致性快照 | 遍历期间可能看到也可能看不到并发写入 |
-| 写多时性能并不比 `Mutex + map` 好 | 用错场景反而更慢 |
-
-选择标准很简单：**key 集合基本固定、读远多于写**（例如**已注册的连接**、**已加载的模块**）→ `sync.Map`；其他情况 → `map` + `Mutex`/`RWMutex`。
-
-### 3. `sync.Pool`：临时对象复用
-
-**问题**：高频请求里反复创建/丢弃大对象（例如 4KB 的缓冲区），会把压力全压给 GC。
-
-```go
-var bufPool = sync.Pool{
-    New: func() any { return make([]byte, 0, 4096) },
-}
-
-func handle() {
-    buf := bufPool.Get().([]byte)
-    defer bufPool.Put(buf[:0]) // 用完还回去
-    buf = append(buf, "hello"...)
-}
-```
-
-| 要点 | 说明 |
-| --- | --- |
-| `Get()` / `Put(x)` | 取与还；`Get` 在没有可用对象时调用 `New` |
-| 不保证命中 | 池里的对象可能在任意一次 GC 时被清空 |
-| 对象状态未知 | `Get` 拿到的可能是别人用过的，**必须重置**（`buf[:0]` 就是重置长度） |
-| 不是缓存 | 不能用来缓存有业务含义的数据，因为它随时会消失 |
-| 返回值是 `any` | 需要类型断言 |
-
-一句话：`Pool` 是**减少分配**的工具，不是**保存数据**的工具。
-
-### 4. `sync.Cond`：条件等待
-
-**问题**：一个 goroutine 要等到某个条件成立才继续（任务队列非空、缓冲区可写）。没有 `Cond`，只能**循环 + `Sleep` 轮询**：要么延迟高，要么空转烧 CPU。
-
-```go
-type Queue struct {
-    mu    sync.Mutex
-    cond  *sync.Cond
-    items []int
-}
-
-func NewQueue() *Queue {
-    q := &Queue{}
-    q.cond = sync.NewCond(&q.mu)
-    return q
-}
-
-func (q *Queue) Push(v int) {
-    q.mu.Lock()
-    defer q.mu.Unlock()
-    q.items = append(q.items, v)
-    q.cond.Signal() // 唤醒一个等待者
-}
-
-func (q *Queue) Pop() int {
-    q.mu.Lock()
-    defer q.mu.Unlock()
-    for len(q.items) == 0 { // 必须用循环，不能只 if 一次
-        q.cond.Wait()
-    }
-    v := q.items[0]
-    q.items = q.items[1:]
-    return v
-}
-```
-
-| 方法 | 语义 |
-| --- | --- |
-| `NewCond(l Locker)` | 绑定一把锁（通常是 `*sync.Mutex` 或 `*sync.RWMutex`） |
-| `Wait()` | **先解锁并阻塞，被唤醒后重新加锁**再返回 |
-| `Signal()` | 唤醒一个等待者 |
-| `Broadcast()` | 唤醒所有等待者 |
-
-三条必须记住的规则：
-
-1. `Wait` 必须在持锁状态下调用，否则 panic。
-2. `Wait` 返回不代表条件已成立（可能被无关的 `Signal` 唤醒），所以**必须放在 `for` 循环里重新检查条件**。
-3. 修改条件后要持锁调用 `Signal`/`Broadcast`。
-
-**为什么现在用得少了**：大多数**等条件**的场景已经被 channel 覆盖——等一个事件用 `<-ch`，广播用 `close(ch)`。`Cond` 仍有它的位置：需要反复等待、且等待者与唤醒者共享同一份可变状态时（例如自建连接池的空闲列表）。
-
-### 5. `sync/atomic`：单变量的无锁操作
-
-**问题**：一个计数器、一个开关标志，用 `Mutex` 太重——加锁本身有开销，还会让本来无冲突的操作排队。
-
-```go
-var (
-    requests atomic.Int64
-    ready    atomic.Bool
-)
-
-requests.Add(1)
-ready.Store(true)
-if ready.Load() {
-    n := requests.Swap(0) // 取旧值并写入新值
-    fmt.Println("reset from", n)
-}
-if requests.CompareAndSwap(0, 1) { // 只有当前值等于 0 时才写入 1
-    // ...
-}
-```
-
-| 操作族 | 方法 | 用途 |
-| --- | --- | --- |
-| 加法 | `Add` | 计数 |
-| 读 | `Load` | 读取 |
-| 写 | `Store` | 写入 |
-| 交换 | `Swap` | 取值并重置 |
-| 比较并交换 | `CompareAndSwap` | 实现**只在值没变时才更新** |
-
-Go 1.19 起提供了类型化的原子类型：`atomic.Bool`、`atomic.Int32`、`atomic.Int64`、`atomic.Uint32`、`atomic.Uint64`、`atomic.Uintptr`、`atomic.Pointer[T]`、`atomic.Value`（可存任意类型的值，但同一个 `Value` 里必须始终存同一具体类型）。
-
-```go
-var cfg atomic.Pointer[Config] // 配置热更新：读多写少，读侧无锁
-
-func current() *Config { return cfg.Load() }
-func reload(c *Config) { cfg.Store(c) } // 整个指针换掉，读方永远看到完整的旧配置或新配置
-```
-
-`atomic` 的边界：
-
-| 能做 | 不能做 |
-| --- | --- |
-| 单个变量的原子读写改 | 保证多个变量之间的一致（要锁） |
-| 发布不可变对象（换指针） | 保护一个会被逐步修改的结构体 |
-| 状态标志、计数、一次性开关 | 复合逻辑（**先查再改**需要 CAS 循环，容易写错） |
-
-### 6. 小结表
-
-| 工具 | 没有它会怎样 | 一句话记住 |
-| --- | --- | --- |
-| `WaitGroup` | 不知道一组任务是否都结束 | 计数等待 |
-| `Mutex` | 共享内存被并发读写，结果错或进程崩 | 互斥 + 建立顺序 |
-| `RWMutex` | 读多写少时读被串行化 | 多读单写 |
-| `Once` | 初始化重复执行 | 只做一次 |
-| `Map` | 并发 map 操作让进程退出 | 读多写少的内建并发表 |
-| `Pool` | 高频分配压垮 GC | 复用临时对象 |
-| `Cond` | 等条件只能轮询 | 条件等待（现在少用） |
-| `atomic` | 单变量也要用锁，开销大 | 单变量无锁操作 |
 
 ---
 ## 七、组合：把工具拼起来能得到什么
 
-前面六部分讲的是零件。真实的并发功能都是**组合**出来的，而且组合方式相当固定——八成的场景就是下面这几种。这一节对每个功能都给出四件事：**要实现什么**、**组合了哪些 API**、**代码**、**去掉某个零件会怎样**。
+前面六部分讲的是零件。真实的并发功能都是**组合**出来的，而且组合方式相当固定——八成的场景就是下面这几种。这一节对每个功能都给出三件事：**要实现什么**、**组合了哪些 API**、**代码**，最后用一句话点出**少了某个零件会怎样**。
 
 ### 0. 组合矩阵
 
@@ -1102,13 +875,11 @@ func reload(c *Config) { cfg.Store(c) } // 整个指针换掉，读方永远看�
 
 结论可以先说：**`channel` + `select`/`context` + `WaitGroup` 这三件套覆盖了绝大多数并发场景**，锁只在**有真正被共享的内存**时出场。
 
-> **版本提示**：下面示例里出现的 `wg.Go(...)` 是 Go 1.25 新增的写法（等价于 `wg.Add(1)` + `go func(){ defer wg.Done(); ... }()`）。如果你的工具链更旧，用 `go version` 确认后改回三件套即可，逻辑完全一样。
+> **版本提示**：本课示例里出现的 `wg.Go(...)` 是 Go 1.25 新增的写法（等价于 `wg.Add(1)` + `go func(){ defer wg.Done(); ... }()`）。如果你的工具链更旧，用 `go version` 确认后改回三件套即可，逻辑完全一样。
 
 ### 1. 流水线（pipeline）
 
-**要实现什么**：把一个大任务拆成若干级，每一级独立 goroutine 处理，数据像流水线一样流过；上游处理完自动告诉下游**没有更多了**。
-
-**组合**：`channel`（级与级之间的传送带）+ `close`（结束信号）+ `for range`（分级循环）。
+**要实现什么**：把一个大任务拆成若干级，每级一个 goroutine，数据像流水线一样流过；上游处理完自动告诉下游**没有更多了**。**组合**：`channel` + `close` + `for range`。
 
 ```text
  generate ──ch1──►  square ──ch2──►  filter ──ch3──►  消费
@@ -1147,18 +918,11 @@ func main() {
 }
 ```
 
-| 去掉某个零件 | 后果 |
-| --- | --- |
-| 没有 `defer close(out)` | 下游 `range` 永远不结束，`main` 卡在最后一行 |
-| 由下游 `close` | 上游发送时 panic |
-| 只有一级就 `close`，漏了中间级 | 中间级后的所有消费者一起卡住 |
-| 下游提前退出（例如只想取前 3 个） | 上游卡在发送上 → goroutine 泄漏，需要把 `ctx` 接进每一级的收发 |
-
-流水线最容易被忽略的一点是：**它的价值不在快，而在可组合**。每一级都是**输入 channel → 输出 channel**的纯函数形状，所以能像搭积木一样加减级数，也能把某一级换成 fan-out。
+少了任何一级的 `defer close(out)`，下游的 `range` 就永远不结束；下游提前退出（只想取前几个），上游会卡在发送上泄漏。流水线的价值不在快，而在**可组合**：每级都是**输入 channel → 输出 channel** 的纯函数形状，能像搭积木一样增删。
 
 ### 2. fan-out / fan-in（分发与汇聚）
 
-**要实现什么**：同一个输入被多个 worker 并行消费（fan-out，天然负载均衡：谁先空下来谁先拿），多个输出的结果再汇总成一个（fan-in）。
+**要实现什么**：同一个输入被多个 worker 并行消费（fan-out，天然负载均衡：谁先空下来谁先拿），多个输出再汇总成一个（fan-in）。**组合**：`channel` + `WaitGroup`（判断所有生产者都结束了）+ 单点 `close`。
 
 ```text
                         ┌──► worker 1 ──┐
@@ -1166,8 +930,6 @@ func main() {
                         └──► worker 3 ──┘
                          fan-out        fan-in
 ```
-
-**组合**：`channel`（分发 + 汇聚）+ `WaitGroup`（判断**所有生产者都结束了**）+ 单点 `close`（汇聚出口）。
 
 ```go
 func merge(inputs ...<-chan int) <-chan int {
@@ -1190,25 +952,11 @@ func merge(inputs ...<-chan int) <-chan int {
 }
 ```
 
-| 去掉某个零件 | 后果 |
-| --- | --- |
-| 没有 `WaitGroup` | 不知道什么时候所有输入都排空了，`close(out)` 无从下手 |
-| 在每个生产者里 `close(out)` | 第二个生产者也 close 时 panic |
-| 在 `merge` 里直接 `wg.Wait()` | 函数阻塞到全部处理完才返回，失去了**边跑边消费**的意义 |
-
-这段代码还有三个关键点，值得逐个拆开：
-
-1. `in` 被当作**参数传入**闭包，而不是直接捕获循环变量。Go 1.22 起 `for range` 的循环变量是每轮独立的，可以不写参数；但在 1.22 之前必须这样传，否则所有 goroutine 会读到同一个（循环结束后最终的）值。写参数是兼容性更好的习惯。
-2. `wg.Wait()` 在**另一个 goroutine** 里执行。如果直接在 `merge` 里 `wg.Wait()` 再 `close`，函数就会阻塞到所有输入处理完才能返回 `out`——那就退化成同步了。
-3. `close(out)` 只可能被执行一次，因为 `wg.Wait()` 只返回一次。
-
-**顺序会变**：fan-out 之后结果的到达顺序不再等于输入顺序。如果要保序，见第 5 小节。
+三个容易写错的地方：`close(out)` 只能有一个执行者（第二次 close 就 panic）；`wg.Wait()` 必须放在**另一个** goroutine 里，否则函数会阻塞到全部处理完才返回；`in` 最好当参数传进闭包（Go 1.22 之前循环变量会被所有 goroutine 共享）。**顺序会变**——fan-out 之后结果到达顺序不再等于输入顺序，要保序见第 5 小节。
 
 ### 3. 固定 worker 数量的任务池
 
-**要实现什么**：限制**同一时刻有多少个任务在跑**。不限制时，一万个请求就起一万个 goroutine，下游数据库连接池会被打爆；限制后，goroutine 数量固定，任务排队等待。
-
-**组合**：`jobs` channel（任务队列）+ `results` channel（结果回收）+ `WaitGroup`（等 worker 全退出）+ `context`（取消）。
+**要实现什么**：限制**同一时刻有多少个任务在跑**。不限制时一万个请求就起一万个 goroutine，下游连接池会被打爆。**组合**：`jobs` channel（任务队列）+ `results` channel（结果回收）+ `WaitGroup`（等 worker 全退出）+ `context`（取消）。
 
 ```go
 type Result struct {
@@ -1273,27 +1021,11 @@ func run(ctx context.Context, jobs []int, workerCount int) []Result {
 }
 ```
 
-这个结构里有三个关闭点，各自的责任必须分清，这张表是任务池的核心：
-
-| 关闭点 | 由谁执行 | 为什么是它 | 写错的后果 |
-| --- | --- | --- | --- |
-| `close(jobCh)` | 投递任务的 goroutine | 只有它知道**没有更多任务了** | 由 worker 关闭：互相 close → panic |
-| `close(resultCh)` | `wg.Wait()` 之后的协调 goroutine | 只有它知道**所有 worker 都停了** | 由调用方关闭：worker 还在发送 → panic |
-| `ctx` 的 `cancel()` | 调用方（`defer cancel()`） | 生命周期由调用方拥有 | 忘记调用：计时器与子 context 泄漏 |
-
-| 去掉某个零件 | 后果 |
-| --- | --- |
-| 去掉 `ctx.Done()` 分支 | 取消后 worker 仍会继续取任务；调用方退出后它们阻塞在 `results <-` 上 |
-| 去掉 `WaitGroup` | 无法知道 worker 何时全部退出，`resultCh` 无法安全关闭 |
-| 不用 channel 而让每个任务 `go` 一下 | goroutine 数量随任务量线性增长，失去限流意义 |
-
-**一个必须接受的代价**：结果顺序不确定。谁先算完谁先发。需要顺序就配合第 5 小节的按下标写入。
+三个关闭点必须各自分清：`close(jobCh)` 由**投递者**做（只有它知道没有更多任务了），`close(resultCh)` 由 `wg.Wait()` 之后的**协调者**做（只有它知道所有 worker 都停了），`ctx` 的 `cancel()` 由**调用方**做——写错的后果都是 panic 或泄漏。**一个必须接受的代价**：结果顺序不确定，谁先算完谁先发；要保序配合第 5 小节的按下标写入。
 
 ### 4. 带超时与取消的批量任务
 
-**要实现什么**：一次并发做 N 件事，整体最多等 3 秒；到点就返回已经拿到的部分结果，不让调用方无限期挂起。
-
-**组合**：`context.WithTimeout`（谁该停）+ 任务内检查 `ctx`（协作式退出）+ `WaitGroup` + `channel`（结果）。
+**要实现什么**：一次并发做 N 件事，整体最多等 3 秒，到点返回已拿到的部分结果。**组合**：`context.WithTimeout` + 任务内检查 `ctx` + `WaitGroup` + `channel`。
 
 ```go
 func gather(ctx context.Context, jobs []int, workers int) []Result {
@@ -1308,18 +1040,11 @@ func gather(ctx context.Context, jobs []int, workers int) []Result {
 }
 ```
 
-| 关键点 | 说明 |
-| --- | --- |
-| 超时是**协作式**的 | `ctx` 只负责广播，任务的退出必须自己在 `select` 里检查 |
-| 拿到的结果数量不确定 | 这是特性不是 bug：部分结果 + 明确的错误信息，比**什么都没有**有用 |
-| `cancel()` 一定要调用 | 即使已经超时，也释放资源 |
-| 区分 `Canceled` 与 `DeadlineExceeded` | 前者是上游主动取消，后者是超时，日志里要能看出区别 |
+要点：超时是**协作式**的，`ctx` 只负责广播，退出要任务自己在 `select` 里检查；结果数量不确定是特性不是 bug——部分结果 + 明确的错误信息，比什么都没有有用；`cancel()` 即使已经超时也要调用；日志里要能区分 `Canceled`（上游主动取消）和 `DeadlineExceeded`（超时）。
 
 ### 5. 并发聚合（需要保序时）
 
-**要实现什么**：并发处理一个切片，结果**按输入顺序**放进结果切片，且不需要任何锁。
-
-**组合**：`WaitGroup`（等待）+ 预分配切片 + **按下标写入**。
+**要实现什么**：并发处理一个切片，结果**按输入顺序**放进结果切片，且不用任何锁。**组合**：`WaitGroup` + 预分配切片 + **按下标写入**。
 
 ```go
 func mapAll(inputs []int, workers int) ([]int, error) {
@@ -1355,13 +1080,11 @@ func mapAll(inputs []int, workers int) ([]int, error) {
 | 用 `Mutex` 保护 `append` | 安全但慢 | 所有结果汇聚到一把锁上 |
 | 通过 channel 回收 | 安全，但不保序 | 需要额外记录下标来恢复顺序 |
 
-这三种手法（按下标写、加锁、走 channel）在真实项目里都会出现，判断标准就是：**能不能让每个 goroutine 只碰自己的那一份**。能，就不用锁。
+判断标准只有一句：**能不能让每个 goroutine 只碰自己的那一份**。能，就不用锁。
 
 ### 6. 错误传播与快速失败
 
-**要实现什么**：一批并发任务里任何一个失败，立刻取消其余的，并把第一个错误返回给调用方。
-
-**组合**：`context.WithCancel`（一个失败就广播停止）+ 容量为 1 的 `error` channel（只记第一个错误）+ `select` + `default`（有人记过错误就不必阻塞）+ `WaitGroup`（等大家收摊）。
+**要实现什么**：一批并发任务里任何一个失败，立刻取消其余的，并把第一个错误返回给调用方。**组合**：`context.WithCancel` + 容量 1 的 `error` channel + `select`/`default` + `WaitGroup`。
 
 ```go
 func runAll(ctx context.Context, jobs []int) error {
@@ -1392,14 +1115,9 @@ func runAll(ctx context.Context, jobs []int) error {
 }
 ```
 
-| 写法 | 后果 |
-| --- | --- |
-| 只收集错误、不 `cancel()` | 一个任务失败后其余的还在跑，浪费资源、延迟返回 |
-| `cancel()` 但不等 `wg.Wait()` | 函数返回后还有 goroutine 活着，泄漏 |
-| `errCh` 不带缓冲、也不用 `select`/`default` | 第二个出错的任务阻塞在发送上，`wg.Wait()` 永远等不完 |
-| 用普通变量 `firstErr = err` 记录 | 数据竞争，`-race` 会直接报出来 |
+要点：`errCh` 容量必须是 1 且发送用 `select`/`default`，否则第二个出错的任务会阻塞在发送上，`wg.Wait()` 永远等不完；`cancel()` 之后必须 `wg.Wait()`，否则函数返回后还有 goroutine 活着；用普通变量记第一个错误会有数据竞争。
 
-`golang.org/x/sync/errgroup` 把这套模式封装好了，等价写法是：
+`golang.org/x/sync/errgroup` 把这套模式封装好了：
 
 ```go
 g, ctx := errgroup.WithContext(ctx)
@@ -1409,13 +1127,11 @@ for _, job := range jobs {
 err := g.Wait() // 返回第一个错误，并保证所有 goroutine 已退出
 ```
 
-理解上面的手写版本之后，`errgroup` 就只是省事的语法糖——**它没有引入任何新概念，只是把错误 channel + cancel + WaitGroup 打包**。
+它就是**错误 channel + cancel + WaitGroup** 的语法糖，没有新概念。
 
 ### 7. 并发限流（信号量）
 
-**要实现什么**：不管有多少任务，同一时刻最多只有 K 个在跑。这是保护下游（数据库、第三方接口）最直接的手段。
-
-**组合**：容量为 K 的 `channel` 当令牌桶 + `WaitGroup`（等待）。可选地加上 `context`。
+**要实现什么**：不管有多少任务，同一时刻最多 K 个在跑——保护下游（数据库、第三方接口）最直接的手段。**组合**：容量为 K 的 `channel` 当令牌桶 + `WaitGroup`。
 
 ```go
 func limited(jobs []int, limit int) []int {
@@ -1435,20 +1151,11 @@ func limited(jobs []int, limit int) []int {
 }
 ```
 
-| 方案 | 并发上限 | 缺点 |
-| --- | --- | --- |
-| 每个任务一个 goroutine | 无限 | 内存、文件描述符、下游连接被打爆 |
-| 固定 worker 任务池 | worker 数 | 需要多写一层队列 |
-| 信号量 | limit | 每个任务仍然是一个 goroutine，只是被挡住；任务量极大时仍要小心 |
-| 令牌桶 + `context` | limit | 等令牌时也要能被取消，`select` 要写在取令牌那一步 |
-
-信号量适合**任务数不算巨大、但每个任务要独占一个外部资源**的场景；任务池适合**任务源源不断**的场景。
+和固定 worker 任务池的区别只有一问：**任务源源不断**（队列式）用任务池，**任务数不算巨大但要独占外部资源**用信号量。信号量里每个任务仍是一个 goroutine，只是被挡住，任务量极大时仍要小心；要在等令牌时也能取消，就把 `select` 写在取令牌那一步。
 
 ### 8. 优雅关闭
 
-**要实现什么**：收到停止信号后，第一，不再接受新任务；第二，通知在途任务尽快收尾；第三，等它们真正结束；第四，如果超过给定时间还没结束，就报错退出而不是无限等。
-
-**组合**：`Mutex`（保护**是否已关闭**这个共享标志）+ `close(done)`（广播收尾）+ `WaitGroup`（在途任务计数）+ `context`（兜底超时）。
+**要实现什么**：收到停止信号后——① 不再接受新任务；② 通知在途任务收尾；③ 等它们真正结束；④ 超过给定时间还没结束就报错退出。**组合**：`Mutex`（保护**是否已关闭**）+ `close(done)`（广播）+ `WaitGroup`（在途计数）+ `context`（兜底超时）。
 
 ```text
    正常运行
@@ -1517,19 +1224,11 @@ func (s *Service) Shutdown(ctx context.Context) error {
 }
 ```
 
-三个易错点：
-
-| 易错点 | 后果 |
-| --- | --- |
-| `closed` 检查与 `wg.Add(1)` 不在一段临界区里 | 关闭流程可能已经 `Wait` 完，之后才 `Add`，出现**没人等的在途任务** |
-| 持锁调用 `wg.Wait()` | 在途任务若需要这把锁 → 死锁；同时新任务还进不来 |
-| 只 `close(done)` 不 `Wait` | 函数返回时还有任务在跑，程序退出时数据可能只写了一半 |
+三个易错点：`closed` 检查与 `wg.Add(1)` 必须在同一段临界区里，否则关闭流程可能已经 `Wait` 完才 `Add`，出现**没人等的在途任务**；不能持锁调用 `wg.Wait()`，否则和在途任务、新任务互相锁死；只 `close(done)` 不 `Wait`，程序退出时数据可能只写了一半。
 
 ### 9. 单例初始化与配置热更新
 
-**要实现什么**：连接池/配置只初始化一次；配置可以原子地整体替换，读侧（每个请求）不加锁、不阻塞，也绝不会读到**改了一半**的配置。
-
-**组合**：`sync.Once`（只初始化一次）+ `atomic.Pointer`（读多写少的原子替换）。
+**要实现什么**：连接池/配置只初始化一次；配置能原子地整体替换，读侧（每个请求）不加锁、不阻塞，也绝不会读到**改了一半**的配置。**组合**：`sync.Once` + `atomic.Pointer`。
 
 ```go
 var (
@@ -1550,14 +1249,7 @@ func Reload() {
 }
 ```
 
-| 方案 | 读并发 | 写代价 | 适用 |
-| --- | --- | --- | --- |
-| `Mutex` 包裹 | 串行 | 小 | 读写都少，最简单 |
-| `RWMutex` | 并行 | 中 | 读明显多于写 |
-| `atomic.Value` / `atomic.Pointer` | 并行且无锁 | 极小 | 值是**不可变对象**，整体替换 |
-| 什么都不加 | 数据竞争 | —— | 一定不要 |
-
-关键在**先构造完整，再一次性发布**：`loadConfig()` 返回的对象不再被任何人修改，指针替换是原子操作，读方要么看到整套旧配置、要么看到整套新配置，不会看到中间状态。这也是并发编程里最省心的一条路——**用不可变对象 + 原子发布，代替锁**。
+关键在**先构造完整，再一次性发布**：`loadConfig()` 返回的对象不再被修改，指针替换是原子操作，读方要么看到整套旧配置、要么看到整套新配置。选型只看三点：读写都少用 `Mutex`；读明显多于写用 `RWMutex`；值是**不可变对象、整体替换**才用 `atomic.Pointer`——这是并发编程里最省心的一条路。
 
 ### 10. 每个功能的验收方式
 
@@ -1642,43 +1334,26 @@ func Reload() {
 | 偶发失败，重跑就过 | 用 `-race` 和 `-count=10` 复现 | 时序相关的问题 |
 | 关闭服务时数据写了一半 | 是否只广播了停止，没有等 `WaitGroup` | 优雅关闭缺了第三步 |
 
-### 2. 三个必问的问题
+### 2. 提交前的四问
 
-写并发代码时，这三句话能挡掉绝大多数事故：
+写并发代码时，这四句话能挡掉绝大多数事故；提交时在 PR 描述里逐条写下答案：
 
-1. **这个 channel 的发送方、接收方、关闭方分别是谁？**（答不上来就一定会出问题）
-2. **这个 goroutine 靠什么退出？**（没有答案就是泄漏）
-3. **这个阻塞点会被谁唤醒？**（写不出答案就是死锁）
+1. 每个 channel 的发送方、接收方、关闭方分别是谁？
+2. 每个 goroutine 靠什么退出？每个阻塞点会被谁唤醒？
+3. 共享状态的临界区在哪里？锁有没有覆盖完整的读和写？
+4. 消费者提前返回时，生产者会不会永远阻塞？怎么验证？
 
 ### 3. 命令与工具
 
 ```bash
-gofmt -l .            # 看哪些文件没格式化
-go vet ./...          # 静态检查：copylocks（复制锁）、lostcancel（忘记 cancel）等
-go test ./...         # 跑测试
-go test -race ./...   # 竞态检测：最有用的一条命令
-go test -count=10 ./...   # 重复跑，逼出偶发问题
-go test -timeout 10s ./...  # 卡死时立刻失败，而不是一直挂着
-go test -run TestPool -v ./...  # 只跑某一个测试
+gofmt -l .                 # 看哪些文件没格式化
+go vet ./...               # 静态检查：copylocks（复制锁）、lostcancel（忘记 cancel）等
+go test -race ./...        # 竞态检测：最有用的一条
+go test -count=10 ./...    # 重复跑，逼出偶发问题
+go test -timeout 10s ./... # 卡死时立刻失败，而不是一直挂着
 ```
 
-关于 runtime 的死锁提示要有正确的预期：`fatal error: all goroutines are asleep - deadlock!` **只在所有 goroutine 都阻塞时才出现**。一个真实的服务里总有别的 goroutine 在跑，所以最常见的现象是**程序静静地卡在那里**。这时用 `-timeout` 让测试失败，或者打印 goroutine 栈：
-
-```go
-// 定位泄漏：把当前所有 goroutine 的调用栈打出来
-buf := make([]byte, 1<<20)
-n := runtime.Stack(buf, true) // true：包含所有 goroutine
-fmt.Println(string(buf[:n]))
-```
-
-### 4. 提交前的四个问题
-
-做完练习后，逐条写下答案：
-
-1. 每一个 channel 的发送方、接收方、关闭方是谁？
-2. 每一个 goroutine 的退出条件是什么？
-3. 共享状态的临界区在哪里？锁为什么覆盖了完整的访问（读和写都在里面）？
-4. 如果消费者提前返回，生产者会不会永远阻塞？怎么验证？
+关于 runtime 的死锁提示要有正确的预期：`fatal error: all goroutines are asleep - deadlock!` **只在所有 goroutine 都阻塞时才出现**。真实服务里总有别的 goroutine 在跑，所以最常见的现象是**程序静静地卡在那里**——用 `-timeout` 让测试失败，再用第五部分那个**阻塞点会被谁唤醒**的方法定位。
 
 ---
 
@@ -1745,18 +1420,13 @@ func (p *Pool) Shutdown(ctx context.Context) error
 
 ## 十一、验收与提交
 
-在项目根目录执行：
+在项目根目录执行（命令清单见第九部分）：
 
 ```bash
-gofmt -w .
-go vet ./...
-go test ./...
-go test -race ./...
+gofmt -w . && go vet ./... && go test ./... && go test -race ./...
 ```
 
-四项全过再提交。第一次跑 `-race` 时如果编译报错，先回头看第一部分末尾关于 C 工具链的提示。
-
-提交时在 PR 描述里回答第九部分那四个问题。**这四问不是形式**：它们正是三年后你 review 别人并发代码时会问的东西，而且比代码本身更难写对。
+四项全过再提交。提交时在 PR 描述里回答第九部分那四个问题——**它们正是三年后你 review 别人并发代码时会问的东西，比代码本身更难写对**。
 
 ---
 
