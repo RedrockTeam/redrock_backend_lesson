@@ -7,7 +7,7 @@
 - [lesson-02-collections](2026-2027/lesson-02-collections.md)：go 的其他基本结构例如 map interface 切片的讲解
 - [lesson-03-goroutines](2026-2027/lesson-03-goroutines.md)：从什么是协程和进程出发，讲解go 的协程优势（可对比 c 的复杂创建机制）以及 go 协程的基本使用
 - [lesson-04-sync](2026-2027/lesson-04-sync.md)：对接之前部分 go 协程练习题中的数据竞争问题，并由此介绍锁和 waitgroup
-- lesson5: 计算机网路基础以及 go 的网络包的介绍及使用
+- [lesson-05-networking](2026-2027/lesson-05-ComputerNetwork/26-计网-后端.md): 计算机网路基础以及 go 的网络包的介绍及使用
 - lesson6： web 框架介绍，需包含横向对比和单个 web 框架的深入介绍
 - [lesson-07-database](2026-2027/lesson-07-database.md)：数据库的基础知识和基本原理，基础 sql 语句等
 - lesson8：go 语言中数据库句柄的使用以及简单介绍如何实现上层统一抽象的
