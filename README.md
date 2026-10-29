@@ -2,7 +2,7 @@
 
 
 2026-2027:
-- [lesson-00--notice](2026-2027/lesson-00-notice): ai 使用指南和其他事项
+- [lesson-00--notice](2026-2027/lesson-00-notice.md): ai 使用指南和其他事项
 - [lesson-01-basics](2026-2027/lesson-01-basics.md)：从 c 语言到 go 的语法迁移，go 的 package 讲解
 - [lesson-02-collections](2026-2027/lesson-02-collections.md)：go 的其他基本结构例如 map interface 切片的讲解
 - [lesson-03-goroutines](2026-2027/lesson-03-goroutines.md)：从什么是协程和进程出发，讲解go 的协程优势（可对比 c 的复杂创建机制）以及 go 协程的基本使用
